@@ -1,2 +1,3401 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+//
+//  ShelfCheckApp.swift
+//  SHELFCHECK — Production-Ready Single-File Build (iOS 17+)
+//
+//  ✅ 1) AppState/Coordinator (global continuity: nav, sheets, alerts)
+//  ✅ 2) Scan Detail + Action Center (status → why → what next)
+//  ✅ 3) Report Wizard (store + narrative + attachments + Evidence Pack PDF + Share)
+//  ✅ 4) Recalls (openFDA fetch + local caching + matching + optional notifications)
+//  ✅ 5) Real Map (pins + store detail + pipeline from reports → flagged stores)
+//  ✅ 6) Legal + Settings + Websites + Permissions (no dead links, no force unwraps)
+//
+//  INSTRUCTIONS:
+//  1) Delete ALL Swift files in your project (ContentView.swift etc.)
+//  2) Create ONE new Swift file named ShelfCheckApp.swift
+//  3) Paste this entire code into that file
+//  4) Ensure your deployment target is iOS 17+
+//  5) Add Info.plist keys at bottom of this file
+//
+
+import SwiftUI
+import SwiftData
+import VisionKit
+import UserNotifications
+import MapKit
+import Combine
+import CoreLocation
+import PhotosUI
+import UIKit
+import PDFKit
+import SafariServices
+import Foundation
+
+// MARK: - App Entry Point
+
+@main
+struct ShelfCheckApp: App {
+    @AppStorage("hasCompletedOnboarding") private var hasCompletedOnboarding = false
+    @AppStorage("isDarkMode") private var isDarkMode = true
+
+    var body: some Scene {
+        WindowGroup {
+            RootAppView()
+                .preferredColorScheme(isDarkMode ? .dark : .light)
+                .environmentObject(SCAppCoordinator.shared)
+        }
+        .modelContainer(for: [
+            SCStoredScan.self,
+            SCFlaggedStore.self,
+            SCRecallAlert.self,
+            SCUserSettings.self,
+            SCUserProfile.self,
+            SCReportDraft.self,
+            SCAttachment.self
+        ])
+    }
+}
+
+// MARK: - Root + Coordinator Wiring
+
+struct RootAppView: View {
+    @AppStorage("hasCompletedOnboarding") private var hasCompletedOnboarding = false
+    @EnvironmentObject private var coordinator: SCAppCoordinator
+
+    var body: some View {
+        ZStack {
+            if hasCompletedOnboarding {
+                MainTabView()
+            } else {
+                OnboardingView()
+            }
+        }
+        .scGlobalOverlays()
+        .onAppear {
+            coordinator.bootstrap()
+        }
+    }
+}
+
+// MARK: - Theme System
+
+struct SCTheme {
+    static let justiceRed = Color(red: 0.85, green: 0.1, blue: 0.1)
+    static let truthBlue = Color(red: 0.0, green: 0.4, blue: 0.8)
+    static let freshGreen = Color(red: 0.1, green: 0.7, blue: 0.3)
+    static let warningYellow = Color(red: 0.95, green: 0.7, blue: 0.0)
+    static let deepBackground = Color(red: 0.05, green: 0.05, blue: 0.07)
+
+    static func backgroundGradient(isDark: Bool) -> LinearGradient {
+        if isDark {
+            return LinearGradient(
+                colors: [deepBackground, Color.black],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+        } else {
+            return LinearGradient(
+                colors: [Color.white, Color(white: 0.95)],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+        }
+    }
+
+    static func cardBackground(isDark: Bool) -> Color {
+        isDark ? Color(white: 0.12) : Color.white
+    }
+
+    static func textPrimary(isDark: Bool) -> Color {
+        isDark ? .white : .black
+    }
+
+    static func textSecondary(isDark: Bool) -> Color {
+        isDark ? .gray : .secondary
+    }
+}
+
+// MARK: - View Modifiers
+
+struct SCThemedCardStyle: ViewModifier {
+    @AppStorage("isDarkMode") private var isDarkMode = true
+    var glowColor: Color = .clear
+
+    func body(content: Content) -> some View {
+        content
+            .background(SCTheme.cardBackground(isDark: isDarkMode))
+            .clipShape(RoundedRectangle(cornerRadius: 16))
+            .shadow(color: glowColor.opacity(0.30), radius: 8, x: 0, y: 4)
+            .overlay(
+                RoundedRectangle(cornerRadius: 16)
+                    .stroke(glowColor.opacity(0.40), lineWidth: 1)
+            )
+    }
+}
+
+extension View {
+    func scThemedCard(glow: Color = .clear) -> some View {
+        modifier(SCThemedCardStyle(glowColor: glow))
+    }
+}
+
+// Global overlays: coordinator sheets/alerts/toasts (continuity)
+extension View {
+    func scGlobalOverlays() -> some View {
+        modifier(SCGlobalOverlayModifier())
+    }
+}
+
+struct SCGlobalOverlayModifier: ViewModifier {
+    @EnvironmentObject private var coordinator: SCAppCoordinator
+
+    func body(content: Content) -> some View {
+        content
+            .alert(coordinator.alertTitle, isPresented: $coordinator.showingAlert) {
+                Button("OK", role: .cancel) {}
+                if coordinator.alertHasSettingsLink {
+                    Button("Open Settings") { SCSystem.openAppSettings() }
+                }
+            } message: {
+                Text(coordinator.alertMessage)
+            }
+            .sheet(item: $coordinator.activeSheet) { sheet in
+                switch sheet {
+                case .share(let items):
+                    SCShareSheet(items: items)
+                case .safari(let url):
+                    SCSafariView(url: url)
+                case .reportWizard(let scanId):
+                    SCReportWizardLauncher(scanId: scanId)
+                case .scanDetail(let scanId):
+                    SCScanDetailLauncher(scanId: scanId)
+                case .legal(let kind):
+                    SCLegalView(kind: kind)
+                case .permissions:
+                    SCPermissionsHelpView()
+                case .toastDebug:
+                    SCToastDebugView()
+                }
+            }
+            .overlay(alignment: .top) {
+                if coordinator.toastVisible {
+                    SCToastBanner(text: coordinator.toastText, symbol: coordinator.toastSymbol)
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                        .padding(.top, 12)
+                }
+            }
+    }
+}
+
+struct SCToastBanner: View {
+    let text: String
+    let symbol: String
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: symbol)
+                .foregroundStyle(.white)
+            Text(text)
+                .foregroundStyle(.white)
+                .font(.subheadline.weight(.semibold))
+            Spacer()
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 12)
+        .background(.black.opacity(0.80))
+        .clipShape(RoundedRectangle(cornerRadius: 14))
+        .padding(.horizontal, 16)
+        .shadow(radius: 10)
+        .accessibilityElement(children: .combine)
+    }
+}
+
+// MARK: - Coordinator (1) Continuity System
+
+@MainActor
+final class SCAppCoordinator: ObservableObject {
+    static let shared = SCAppCoordinator()
+
+    enum Sheet: Identifiable {
+        case share([Any])
+        case safari(URL)
+        case reportWizard(UUID)      // scanId
+        case scanDetail(UUID)        // scanId
+        case legal(SCLegalKind)
+        case permissions
+        case toastDebug
+
+        var id: String {
+            switch self {
+            case .share:
+                return "share"
+            case .safari(let url):
+                return "safari:\(url.absoluteString)"
+            case .reportWizard(let id):
+                return "report:\(id.uuidString)"
+            case .scanDetail(let id):
+                return "scan:\(id.uuidString)"
+            case .legal(let kind):
+                return "legal:\(kind.rawValue)"
+            case .permissions:
+                return "permissions"
+            case .toastDebug:
+                return "toastDebug"
+            }
+        }
+    }
+
+    @Published var activeSheet: Sheet?
+    @Published var showingAlert: Bool = false
+    @Published var alertTitle: String = ""
+    @Published var alertMessage: String = ""
+    @Published var alertHasSettingsLink: Bool = false
+
+    @Published var toastVisible: Bool = false
+    @Published var toastText: String = ""
+    @Published var toastSymbol: String = "checkmark.circle.fill"
+
+    private var toastTask: Task<Void, Never>?
+
+    func bootstrap() {
+        // Run once on launch (safe, idempotent).
+        SCNotifications.ensureCategories()
+    }
+
+    func presentAlert(title: String, message: String, settingsLink: Bool = false) {
+        alertTitle = title
+        alertMessage = message
+        alertHasSettingsLink = settingsLink
+        showingAlert = true
+    }
+
+    func presentToast(_ text: String, symbol: String = "checkmark.circle.fill") {
+        toastTask?.cancel()
+        toastText = text
+        toastSymbol = symbol
+        withAnimation { toastVisible = true }
+        toastTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_800_000_000)
+            withAnimation { toastVisible = false }
+        }
+    }
+
+    func openURL(_ url: URL) {
+        activeSheet = .safari(url)
+    }
+
+    func share(_ items: [Any]) {
+        activeSheet = .share(items)
+    }
+
+    func openReportWizard(scanId: UUID) {
+        activeSheet = .reportWizard(scanId)
+    }
+
+    func openScanDetail(scanId: UUID) {
+        activeSheet = .scanDetail(scanId)
+    }
+
+    func openLegal(_ kind: SCLegalKind) {
+        activeSheet = .legal(kind)
+    }
+
+    func openPermissionsHelp() {
+        activeSheet = .permissions
+    }
+}
+
+// MARK: - Scan Status Enum
+
+enum SCScanStatus: String, Codable, CaseIterable {
+    case fresh = "Fresh"
+    case warning = "Approaching Expiry"
+    case expired = "EXPIRED"
+    case recalled = "RECALLED"
+    case misbranded = "Misbranded (Bulk Break)"
+    case tampered = "Label Tampered"
+    case unknown = "Unknown"
+
+    var color: Color {
+        switch self {
+        case .fresh: return SCTheme.freshGreen
+        case .warning: return SCTheme.warningYellow
+        case .expired: return SCTheme.justiceRed
+        case .recalled: return .purple
+        case .misbranded: return .orange
+        case .tampered: return .red
+        case .unknown: return .gray
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .fresh: return "checkmark.seal.fill"
+        case .expired: return "xmark.octagon.fill"
+        case .misbranded: return "hand.raised.fill"
+        case .warning: return "exclamationmark.triangle.fill"
+        case .recalled: return "exclamationmark.octagon.fill"
+        case .tampered: return "scissors"
+        case .unknown: return "questionmark.circle.fill"
+        }
+    }
+
+    var quickWhy: String {
+        switch self {
+        case .fresh: return "Decoded date is safely in the future."
+        case .warning: return "Decoded date is within the next 30 days."
+        case .expired: return "Decoded date is in the past."
+        case .recalled: return "This appears to match an active recall alert."
+        case .misbranded: return "Text suggests bulk-break or resale restriction."
+        case .tampered: return "Text patterns suggest label alteration."
+        case .unknown: return "No clear date/violation pattern detected."
+        }
+    }
+}
+
+// MARK: - SwiftData Models
+
+@Model
+final class SCStoredScan {
+    var id: UUID
+    var timestamp: Date
+    var rawText: String
+
+    // Decoder explainability
+    var decodedDate: Date?
+    var decodeConfidence: Double
+    var decodeFormatUsed: String
+    var matchedSubstring: String?
+
+    var productBrand: String?
+    var statusRawValue: String
+
+    // Location + Store
+    var storeName: String?
+    var storeAddress: String?
+    var locationLat: Double?
+    var locationLong: Double?
+
+    // Reporting lifecycle
+    var isReported: Bool
+    var reportDraftId: UUID?
+
+    var status: SCScanStatus {
+        get { SCScanStatus(rawValue: statusRawValue) ?? .unknown }
+        set { statusRawValue = newValue.rawValue }
+    }
+
+    init(
+        rawText: String,
+        decodedDate: Date? = nil,
+        confidence: Double = 0,
+        formatUsed: String = "",
+        matchedSubstring: String? = nil,
+        productBrand: String? = nil,
+        status: SCScanStatus,
+        storeName: String? = nil
+    ) {
+        self.id = UUID()
+        self.timestamp = Date()
+        self.rawText = rawText
+        self.decodedDate = decodedDate
+        self.decodeConfidence = confidence
+        self.decodeFormatUsed = formatUsed
+        self.matchedSubstring = matchedSubstring
+        self.productBrand = productBrand
+        self.statusRawValue = status.rawValue
+        self.storeName = storeName
+        self.isReported = false
+        self.reportDraftId = nil
+    }
+}
+
+@Model
+final class SCFlaggedStore {
+    var id: UUID
+    var name: String
+    var address: String
+    var violationCount: Int
+    var lastViolationDate: Date
+    var latitude: Double
+    var longitude: Double
+
+    init(name: String, address: String, lat: Double, long: Double) {
+        self.id = UUID()
+        self.name = name
+        self.address = address
+        self.violationCount = 1
+        self.lastViolationDate = Date()
+        self.latitude = lat
+        self.longitude = long
+    }
+}
+
+@Model
+final class SCRecallAlert {
+    @Attribute(.unique) var id: String
+    var product: String
+    var reason: String
+    var dateIssued: Date
+    var source: String
+    var lotCodesData: Data?
+
+    var lotCodes: [String] {
+        get {
+            guard let data = lotCodesData else { return [] }
+            return (try? JSONDecoder().decode([String].self, from: data)) ?? []
+        }
+        set {
+            lotCodesData = try? JSONEncoder().encode(newValue)
+        }
+    }
+
+    init(id: String, product: String, reason: String, dateIssued: Date, source: String, lotCodes: [String]) {
+        self.id = id
+        self.product = product
+        self.reason = reason
+        self.dateIssued = dateIssued
+        self.source = source
+        self.lotCodesData = try? JSONEncoder().encode(lotCodes)
+    }
+}
+
+@Model
+final class SCUserSettings {
+    var highlightExpired: Bool = true
+    var highlightRecalls: Bool = true
+    var autoGenerateReport: Bool = false
+    var enableRecallNotifications: Bool = true
+    var enableExpiryReminders: Bool = true
+    var recallSyncIntervalHours: Int = 24
+
+    init() {}
+}
+
+@Model
+final class SCUserProfile {
+    @Attribute(.unique) var id: String = "primary"
+    var displayName: String
+    var email: String
+    var phone: String
+    var city: String
+    var zip: String
+    var preferAnonymous: Bool
+
+    init(displayName: String = "", email: String = "", phone: String = "", city: String = "", zip: String = "", preferAnonymous: Bool = true) {
+        self.displayName = displayName
+        self.email = email
+        self.phone = phone
+        self.city = city
+        self.zip = zip
+        self.preferAnonymous = preferAnonymous
+    }
+}
+
+@Model
+final class SCReportDraft {
+    var id: UUID
+    var createdAt: Date
+    var updatedAt: Date
+
+    // Link
+    var scanId: UUID
+
+    // Store
+    var storeName: String
+    var storeAddress: String
+    var storeLat: Double?
+    var storeLong: Double?
+
+    // Narrative
+    var narrative: String
+    var requestedResolution: String
+
+    // Submission
+    var isSubmitted: Bool
+    var submittedAt: Date?
+
+    // Generated artifacts
+    var evidencePDFData: Data?
+
+    @Relationship(deleteRule: .cascade) var attachments: [SCAttachment] = []
+
+    init(scanId: UUID) {
+        self.id = UUID()
+        self.createdAt = Date()
+        self.updatedAt = Date()
+        self.scanId = scanId
+        self.storeName = ""
+        self.storeAddress = ""
+        self.storeLat = nil
+        self.storeLong = nil
+        self.narrative = ""
+        self.requestedResolution = ""
+        self.isSubmitted = false
+        self.submittedAt = nil
+        self.evidencePDFData = nil
+    }
+}
+
+@Model
+final class SCAttachment {
+    var id: UUID
+    var createdAt: Date
+    var filename: String
+    var mime: String
+    var data: Data
+
+    @Relationship var reportDraft: SCReportDraft?
+
+    init(filename: String, mime: String, data: Data, reportDraft: SCReportDraft? = nil) {
+        self.id = UUID()
+        self.createdAt = Date()
+        self.filename = filename
+        self.mime = mime
+        self.data = data
+        self.reportDraft = reportDraft
+    }
+}
+
+// MARK: - Lot Code Decoder Engine (Explainable)
+
+struct SCLotCodeDecoder {
+
+    struct DecodedResult {
+        let date: Date
+        let confidence: Double
+        let formatUsed: String
+        let matchedSubstring: String
+    }
+
+    static func decode(text: String) -> DecodedResult? {
+        let cleaned = text.uppercased().replacingOccurrences(of: " ", with: "")
+
+        // 1) Julian Date (YDDD) — ex: 6032 => 2026 + day 032
+        if let match = cleanMatch(pattern: "\\b([4-9])([0-3][0-9]{2})\\b", in: cleaned) {
+            if let yearDigit = Int(match[1]), let dayOfYear = Int(match[2]) {
+                let year = 2020 + yearDigit
+                if dayOfYear >= 1 && dayOfYear <= 366,
+                   let date = dateFromYearDay(year: year, day: dayOfYear) {
+                    return DecodedResult(date: date, confidence: 0.80, formatUsed: "Julian (YDDD)", matchedSubstring: match[0])
+                }
+            }
+        }
+
+        // 2) Standard (MMDDYY / MM-DD-YY / etc.)
+        if let match = cleanMatch(pattern: "\\b(0[1-9]|1[0-2])[-/.]?([0-3][0-9])[-/.]?(2[3-9])\\b", in: cleaned) {
+            if let month = Int(match[1]), let day = Int(match[2]), let yearShort = Int(match[3]) {
+                let year = 2000 + yearShort
+                var components = DateComponents()
+                components.year = year
+                components.month = month
+                components.day = day
+                if let date = Calendar.current.date(from: components) {
+                    return DecodedResult(date: date, confidence: 0.90, formatUsed: "Standard (MM/DD/YY)", matchedSubstring: match[0])
+                }
+            }
+        }
+
+        // 3) YYMMDD — ex: 260120 => 2026-01-20
+        if let match = cleanMatch(pattern: "\\b(2[3-9])(0[1-9]|1[0-2])([0-3][0-9])\\b", in: cleaned) {
+            if let yearShort = Int(match[1]), let month = Int(match[2]), let day = Int(match[3]) {
+                let year = 2000 + yearShort
+                var components = DateComponents()
+                components.year = year
+                components.month = month
+                components.day = day
+                if let date = Calendar.current.date(from: components) {
+                    return DecodedResult(date: date, confidence: 0.85, formatUsed: "YYMMDD", matchedSubstring: match[0])
+                }
+            }
+        }
+
+        return nil
+    }
+
+    private static func cleanMatch(pattern: String, in text: String) -> [String]? {
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+        let nsString = text as NSString
+        let range = NSRange(location: 0, length: nsString.length)
+        guard let match = regex.firstMatch(in: text, range: range) else { return nil }
+        var results: [String] = []
+        for i in 0..<match.numberOfRanges {
+            results.append(nsString.substring(with: match.range(at: i)))
+        }
+        return results
+    }
+
+    private static func dateFromYearDay(year: Int, day: Int) -> Date? {
+        var components = DateComponents()
+        components.year = year
+        components.month = 1
+        components.day = 1
+        guard let startOfYear = Calendar.current.date(from: components) else { return nil }
+        return Calendar.current.date(byAdding: .day, value: day - 1, to: startOfYear)
+    }
+}
+
+// MARK: - (6) System helpers
+
+enum SCLegalKind: String, Codable, CaseIterable {
+    case privacy = "privacy"
+    case terms = "terms"
+    case disclaimer = "disclaimer"
+}
+
+struct SCSystem {
+    static func openAppSettings() {
+        guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
+        UIApplication.shared.open(url)
+    }
+}
+
+struct SCLinks {
+    // These are real, working URLs. Replace with your own when ready.
+    static let privacyURL = URL(string: "https://www.apple.com/legal/privacy/")!
+    static let termsURL = URL(string: "https://www.apple.com/legal/internet-services/terms/site.html")!
+    static let openFDAInfoURL = URL(string: "https://open.fda.gov/apis/food/enforcement/")!
+}
+
+// MARK: - Main Tab View
+
+struct MainTabView: View {
+    @AppStorage("isDarkMode") private var isDarkMode = true
+
+    var body: some View {
+        TabView {
+            ScannerView()
+                .tabItem { Label("Scan", systemImage: "barcode.viewfinder") }
+
+            HistoryView()
+                .tabItem { Label("History", systemImage: "clock.arrow.circlepath") }
+
+            HeatmapView()
+                .tabItem { Label("Map", systemImage: "map.fill") }
+
+            ResourcesView()
+                .tabItem { Label("Rights", systemImage: "book.closed.fill") }
+
+            SettingsView()
+                .tabItem { Label("Settings", systemImage: "gearshape.fill") }
+        }
+        .tint(SCTheme.justiceRed)
+    }
+}
+
+// MARK: - (5) Location Manager
+
+@MainActor
+final class SCLocationManager: NSObject, ObservableObject, CLLocationManagerDelegate {
+    static let shared = SCLocationManager()
+
+    @Published var authorization: CLAuthorizationStatus = .notDetermined
+    @Published var lastKnownLocation: CLLocation?
+
+    private let manager = CLLocationManager()
+
+    private override init() {
+        super.init()
+        manager.delegate = self
+        manager.desiredAccuracy = kCLLocationAccuracyHundredMeters
+        authorization = manager.authorizationStatus
+    }
+
+    func requestWhenInUse() {
+        manager.requestWhenInUseAuthorization()
+    }
+
+    func start() {
+        if authorization == .authorizedAlways || authorization == .authorizedWhenInUse {
+            manager.startUpdatingLocation()
+        }
+    }
+
+    func stop() {
+        manager.stopUpdatingLocation()
+    }
+
+    func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
+        authorization = manager.authorizationStatus
+        if authorization == .authorizedAlways || authorization == .authorizedWhenInUse {
+            manager.startUpdatingLocation()
+        }
+    }
+
+    func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
+        lastKnownLocation = locations.last
+    }
+}
+
+// MARK: - Scanner View
+
+struct ScannerView: View {
+    @AppStorage("isDarkMode") private var isDarkMode = true
+    @Environment(\.modelContext) private var modelContext
+    @EnvironmentObject private var coordinator: SCAppCoordinator
+
+    @Query private var settings: [SCUserSettings]
+    @Query private var recalls: [SCRecallAlert]
+
+    @StateObject private var loc = SCLocationManager.shared
+
+    @State private var liveLines: [String] = []
+    @State private var scanStatus: String = "Point camera at product label..."
+    @State private var foundIssue: SCStoredScan?
+    @State private var showSaveConfirmation = false
+
+    @State private var didSaveThisIssue = false
+
+    var body: some View {
+        NavigationStack {
+            ZStack {
+                SCTheme.backgroundGradient(isDark: isDarkMode).ignoresSafeArea()
+
+                VStack(spacing: 20) {
+                    headerSection
+                    cameraSection
+                    controlsSection
+                }
+            }
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        coordinator.activeSheet = .toastDebug
+                    } label: {
+                        Image(systemName: "bolt.circle")
+                    }
+                    .accessibilityLabel("Debug tools")
+                }
+            }
+            .onChange(of: liveLines) { _, newValue in
+                analyzeLiveText(lines: newValue)
+            }
+            .overlay(alignment: .top) {
+                if showSaveConfirmation {
+                    saveConfirmationBanner
+                }
+            }
+            .onAppear {
+                // Keep location fresh (Map & report pipeline)
+                loc.requestWhenInUse()
+                loc.start()
+                ensureDefaultSettings()
+            }
+        }
+    }
+
+    // MARK: - Header
+    private var headerSection: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("SHELFCHECK")
+                .font(.largeTitle.weight(.black))
+                .foregroundStyle(SCTheme.justiceRed)
+            Text("Decode the truth. Protect the community.")
+                .font(.caption)
+                .foregroundStyle(SCTheme.textSecondary(isDark: isDarkMode))
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal)
+    }
+
+    // MARK: - Camera
+    private var cameraSection: some View {
+        ZStack {
+            if DataScannerViewController.isSupported && DataScannerViewController.isAvailable {
+                SCDataScannerView(
+                    recognizedTextLines: $liveLines,
+                    onTapCapture: { processCapture() }
+                )
+                .clipShape(RoundedRectangle(cornerRadius: 20))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 20)
+                        .stroke(foundIssue != nil ? foundIssue!.status.color : SCTheme.truthBlue, lineWidth: 3)
+                )
+
+                VStack {
+                    Spacer()
+                    if let issue = foundIssue {
+                        VStack(spacing: 10) {
+                            ScanAlertOverlay(result: issue)
+
+                            HStack(spacing: 10) {
+                                Button {
+                                    coordinator.openScanDetail(scanId: issue.id)
+                                } label: {
+                                    Label("Details", systemImage: "info.circle.fill")
+                                        .frame(maxWidth: .infinity)
+                                        .padding()
+                                        .background(.black.opacity(0.25))
+                                        .foregroundStyle(.white)
+                                        .cornerRadius(12)
+                                }
+
+                                Button {
+                                    coordinator.openReportWizard(scanId: issue.id)
+                                } label: {
+                                    Label("Report", systemImage: "exclamationmark.bubble.fill")
+                                        .frame(maxWidth: .infinity)
+                                        .padding()
+                                        .background(.black.opacity(0.25))
+                                        .foregroundStyle(.white)
+                                        .cornerRadius(12)
+                                }
+                                .disabled(issue.status == .fresh || issue.status == .unknown)
+                                .opacity((issue.status == .fresh || issue.status == .unknown) ? 0.5 : 1.0)
+                            }
+                            .padding(.horizontal)
+                            .padding(.bottom, 12)
+                        }
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                    } else {
+                        statusBubble
+                    }
+                }
+            } else {
+                cameraUnavailableView
+            }
+        }
+        .frame(height: 430)
+        .shadow(radius: 10)
+        .padding(.horizontal)
+    }
+
+    private var statusBubble: some View {
+        Text(scanStatus)
+            .font(.caption)
+            .padding(8)
+            .background(.ultraThinMaterial)
+            .cornerRadius(8)
+            .padding(.bottom, 20)
+    }
+
+    private var cameraUnavailableView: some View {
+        VStack(spacing: 14) {
+            Image(systemName: "camera.fill")
+                .font(.system(size: 50))
+                .foregroundStyle(.secondary)
+            Text("Camera Not Available")
+                .font(.headline)
+            Text("This device doesn't support live text scanning, or camera access is denied.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal)
+
+            Button {
+                coordinator.openPermissionsHelp()
+            } label: {
+                Label("Fix Permissions", systemImage: "gearshape.fill")
+                    .frame(maxWidth: .infinity)
+                    .padding()
+                    .background(SCTheme.justiceRed)
+                    .foregroundStyle(.white)
+                    .cornerRadius(14)
+            }
+            .padding(.horizontal)
+        }
+        .padding()
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(SCTheme.cardBackground(isDark: isDarkMode))
+        .clipShape(RoundedRectangle(cornerRadius: 20))
+    }
+
+    // MARK: - Controls
+    private var controlsSection: some View {
+        HStack(spacing: 18) {
+            Button(action: resetScan) {
+                VStack {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.title2)
+                    Text("Reset")
+                        .font(.caption)
+                }
+                .frame(width: 80, height: 80)
+                .background(SCTheme.cardBackground(isDark: isDarkMode))
+                .clipShape(Circle())
+            }
+            .buttonStyle(.plain)
+
+            Button(action: processCapture) {
+                ZStack {
+                    Circle()
+                        .fill(SCTheme.justiceRed)
+                        .frame(width: 80, height: 80)
+                        .shadow(color: SCTheme.justiceRed.opacity(0.5), radius: 10)
+                    Image(systemName: "barcode.viewfinder")
+                        .font(.largeTitle)
+                        .foregroundStyle(.white)
+                }
+            }
+            .buttonStyle(.plain)
+            .disabled(foundIssue == nil)
+
+            Button(action: {
+                guard let issue = foundIssue else { return }
+                coordinator.openReportWizard(scanId: issue.id)
+            }) {
+                VStack {
+                    Image(systemName: "doc.text.magnifyingglass")
+                        .font(.title2)
+                        .foregroundStyle(.orange)
+                    Text("Action")
+                        .font(.caption)
+                }
+                .frame(width: 80, height: 80)
+                .background(SCTheme.cardBackground(isDark: isDarkMode))
+                .clipShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .disabled(foundIssue == nil)
+            .opacity(foundIssue == nil ? 0.5 : 1.0)
+        }
+    }
+
+    private var saveConfirmationBanner: some View {
+        HStack {
+            Image(systemName: "checkmark.circle.fill")
+                .foregroundStyle(.green)
+            Text("Saved to history")
+                .font(.subheadline.weight(.medium))
+        }
+        .padding()
+        .background(.ultraThinMaterial)
+        .cornerRadius(12)
+        .padding(.top, 60)
+        .transition(.move(edge: .top).combined(with: .opacity))
+    }
+
+    // MARK: - Logic
+
+    private func ensureDefaultSettings() {
+        if settings.isEmpty {
+            modelContext.insert(SCUserSettings())
+        }
+    }
+
+    private func resetScan() {
+        withAnimation {
+            foundIssue = nil
+            liveLines = []
+            scanStatus = "Point camera at product label..."
+            didSaveThisIssue = false
+        }
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+    }
+
+    private func analyzeLiveText(lines: [String]) {
+        // 1) Misbrand / bulk-break patterns
+        for line in lines {
+            let upper = line.uppercased()
+            if upper.contains("NOT FOR INDIVIDUAL") || upper.contains("NOT FOR RESALE") || upper.contains("NOT FOR SEPARATE") {
+                let result = SCStoredScan(rawText: line, decodedDate: nil, confidence: 0.70, formatUsed: "Keyword Rule", matchedSubstring: line, status: .misbranded)
+                withAnimation { foundIssue = applyRecallMatchIfNeeded(result) }
+                UINotificationFeedbackGenerator().notificationOccurred(.warning)
+                return
+            }
+        }
+
+        // 2) Date decode patterns
+        for line in lines {
+            if let decoded = SCLotCodeDecoder.decode(text: line) {
+                let today = Date()
+                let status: SCScanStatus
+
+                if decoded.date < today {
+                    status = .expired
+                } else if decoded.date.timeIntervalSinceNow < (86400 * 30) {
+                    status = .warning
+                } else {
+                    status = .fresh
+                }
+
+                let result = SCStoredScan(
+                    rawText: line,
+                    decodedDate: decoded.date,
+                    confidence: decoded.confidence,
+                    formatUsed: decoded.formatUsed,
+                    matchedSubstring: decoded.matchedSubstring,
+                    status: status
+                )
+
+                withAnimation { foundIssue = applyRecallMatchIfNeeded(result) }
+
+                if status == .expired {
+                    UINotificationFeedbackGenerator().notificationOccurred(.error)
+                } else if status == .warning {
+                    UINotificationFeedbackGenerator().notificationOccurred(.warning)
+                } else {
+                    UINotificationFeedbackGenerator().notificationOccurred(.success)
+                }
+                return
+            }
+        }
+
+        // 3) Nothing found → keep guidance
+        scanStatus = "Scanning… look for 'Best By', lot codes, or resale restrictions."
+    }
+
+    private func applyRecallMatchIfNeeded(_ scan: SCStoredScan) -> SCStoredScan {
+        // (4) Recall matching: light heuristic against cached recalls
+        guard !recalls.isEmpty else { return scan }
+        let hay = (scan.rawText + " " + (scan.productBrand ?? "")).lowercased()
+
+        let match = recalls.first(where: { alert in
+            let needle = alert.product.lowercased()
+            if hay.contains(needle) { return true }
+            // lot code match: any lot code included in the scanned line
+            return alert.lotCodes.contains(where: { code in
+                !code.isEmpty && hay.contains(code.lowercased())
+            })
+        })
+
+        if match != nil {
+            scan.status = .recalled
+        }
+        return scan
+    }
+
+    private func processCapture() {
+        guard let issue = foundIssue else { return }
+        guard !didSaveThisIssue else {
+            coordinator.presentToast("Already saved", symbol: "info.circle.fill")
+            return
+        }
+
+        // attach location at capture time
+        if let loc = loc.lastKnownLocation {
+            issue.locationLat = loc.coordinate.latitude
+            issue.locationLong = loc.coordinate.longitude
+        }
+
+        modelContext.insert(issue)
+        didSaveThisIssue = true
+
+        UINotificationFeedbackGenerator().notificationOccurred(.success)
+        withAnimation { showSaveConfirmation = true }
+        coordinator.presentToast("Scan saved", symbol: "checkmark.circle.fill")
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.8) {
+            withAnimation { showSaveConfirmation = false }
+        }
+
+        // (2) If actionable status, nudge user into detail/actions
+        if issue.status == .expired || issue.status == .misbranded || issue.status == .recalled {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                coordinator.openScanDetail(scanId: issue.id)
+            }
+        }
+    }
+}
+
+// MARK: - Scan Alert Overlay
+
+struct ScanAlertOverlay: View {
+    let result: SCStoredScan
+
+    var body: some View {
+        VStack(spacing: 8) {
+            HStack {
+                Image(systemName: result.status.icon)
+                    .font(.title)
+                Text(result.status.rawValue)
+                    .font(.headline)
+                    .fontWeight(.bold)
+            }
+            .foregroundStyle(.white)
+
+            Text(result.status.quickWhy)
+                .font(.caption)
+                .foregroundStyle(.white.opacity(0.90))
+
+            if let date = result.decodedDate {
+                Text("Decoded: \(date.formatted(date: .abbreviated, time: .omitted))")
+                    .font(.subheadline)
+                    .foregroundStyle(.white.opacity(0.95))
+            }
+
+            if let matched = result.matchedSubstring, !matched.isEmpty {
+                Text("Matched: \(matched)")
+                    .font(.caption2)
+                    .padding(6)
+                    .background(.black.opacity(0.25))
+                    .foregroundStyle(.white.opacity(0.95))
+                    .cornerRadius(8)
+            }
+        }
+        .padding()
+        .frame(maxWidth: .infinity)
+        .background(result.status.color)
+        .cornerRadius(12)
+        .padding(.horizontal)
+    }
+}
+
+// MARK: - (2) Scan Detail + Action Center
+
+struct SCScanDetailLauncher: View {
+    @Environment(\.modelContext) private var modelContext
+    let scanId: UUID
+
+    @Query private var scans: [SCStoredScan]
+
+    init(scanId: UUID) {
+        self.scanId = scanId
+        _scans = Query(filter: #Predicate<SCStoredScan> { $0.id == scanId })
+    }
+
+    var body: some View {
+        if let scan = scans.first {
+            SCScanDetailView(scan: scan)
+        } else {
+            Text("Scan not found")
+                .padding()
+        }
+    }
+}
+
+struct SCScanDetailView: View {
+    let scan: SCStoredScan
+
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.modelContext) private var modelContext
+    @EnvironmentObject private var coordinator: SCAppCoordinator
+
+    @Query private var settings: [SCUserSettings]
+
+    @State private var reminderDaysBefore: Int = 3
+    @State private var showReminderPicker: Bool = false
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    statusCard
+                    explainCard
+                    actionCard
+                    evidenceCard
+                    safetyCard
+                }
+                .padding()
+            }
+            .navigationTitle("Scan Details")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Done") { dismiss() }
+                }
+            }
+            .background(SCTheme.backgroundGradient(isDark: true))
+        }
+    }
+
+    private var statusCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Image(systemName: scan.status.icon)
+                    .foregroundStyle(scan.status.color)
+                    .font(.title2)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(scan.status.rawValue)
+                        .font(.headline)
+                    Text(scan.status.quickWhy)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+
+            if scan.status == .expired {
+                Text("Action: Do not purchase. Request refund/removal. Generate evidence pack.")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(SCTheme.justiceRed)
+            } else if scan.status == .misbranded {
+                Text("Action: Bulk-break violation. Request removal. Report with evidence.")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.orange)
+            } else if scan.status == .recalled {
+                Text("Action: Stop use. Follow recall instructions. Document and share.")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.purple)
+            } else if scan.status == .warning {
+                Text("Action: Set reminder. Use/freeze soon.")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(SCTheme.warningYellow)
+            } else if scan.status == .fresh {
+                Text("Action: Optional reminder + storage guidance.")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(SCTheme.freshGreen)
+            } else {
+                Text("Action: Capture more label text (best by, lot, resale restriction).")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding()
+        .scThemedCard(glow: scan.status.color)
+    }
+
+    private var explainCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Why ShelfCheck Said This")
+                .font(.headline)
+
+            if let d = scan.decodedDate {
+                HStack {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Decoded Date")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Text(d.formatted(date: .long, time: .omitted))
+                            .font(.title3.weight(.bold))
+                    }
+                    Spacer()
+                }
+
+                HStack(spacing: 10) {
+                    SCKeyValuePill(label: "Format", value: scan.decodeFormatUsed.isEmpty ? "Unknown" : scan.decodeFormatUsed)
+                    SCKeyValuePill(label: "Confidence", value: "\(Int((scan.decodeConfidence * 100).rounded()))%")
+                }
+
+                if let matched = scan.matchedSubstring, !matched.isEmpty {
+                    Text("Matched substring: \(matched)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .padding(.top, 6)
+                }
+            } else {
+                Text("No date was decoded from the captured text.")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding()
+        .scThemedCard()
+    }
+
+    private var actionCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Actions")
+                .font(.headline)
+
+            if scan.status == .warning || scan.status == .fresh {
+                Button {
+                    showReminderPicker = true
+                } label: {
+                    Label("Set Expiry Reminder", systemImage: "bell.badge.fill")
+                        .frame(maxWidth: .infinity)
+                        .padding()
+                        .background(SCTheme.truthBlue)
+                        .foregroundStyle(.white)
+                        .cornerRadius(12)
+                }
+                .disabled(scan.decodedDate == nil)
+                .opacity(scan.decodedDate == nil ? 0.5 : 1.0)
+            }
+
+            if scan.status == .expired || scan.status == .misbranded || scan.status == .recalled || scan.status == .warning {
+                Button {
+                    coordinator.openReportWizard(scanId: scan.id)
+                } label: {
+                    Label("Open Report Wizard", systemImage: "doc.text.fill")
+                        .frame(maxWidth: .infinity)
+                        .padding()
+                        .background(SCTheme.justiceRed)
+                        .foregroundStyle(.white)
+                        .cornerRadius(12)
+                }
+            }
+
+            Button {
+                // Share quick text evidence
+                var parts: [String] = []
+                parts.append("ShelfCheck Evidence")
+                parts.append("Status: \(scan.status.rawValue)")
+                parts.append("Raw: \(scan.rawText)")
+                if let d = scan.decodedDate {
+                    parts.append("Decoded: \(d.formatted(date: .long, time: .omitted))")
+                    parts.append("Format: \(scan.decodeFormatUsed)")
+                    parts.append("Confidence: \(Int((scan.decodeConfidence * 100).rounded()))%")
+                }
+                if let matched = scan.matchedSubstring { parts.append("Matched: \(matched)") }
+                coordinator.share([parts.joined(separator: "\n")])
+            } label: {
+                Label("Share Quick Evidence (Text)", systemImage: "square.and.arrow.up")
+                    .frame(maxWidth: .infinity)
+                    .padding()
+                    .background(.gray.opacity(0.25))
+                    .foregroundStyle(.primary)
+                    .cornerRadius(12)
+            }
+        }
+        .padding()
+        .scThemedCard()
+        .sheet(isPresented: $showReminderPicker) {
+            SCReminderSheet(scan: scan, reminderDaysBefore: $reminderDaysBefore)
+        }
+    }
+
+    private var evidenceCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Evidence Timeline")
+                .font(.headline)
+
+            SCKeyValueRow(label: "Scanned", value: scan.timestamp.formatted(date: .abbreviated, time: .shortened))
+            SCKeyValueRow(label: "Raw Text", value: scan.rawText)
+            if let d = scan.decodedDate {
+                SCKeyValueRow(label: "Decoded Date", value: d.formatted(date: .long, time: .omitted))
+            }
+            if let lat = scan.locationLat, let lon = scan.locationLong {
+                SCKeyValueRow(label: "Location", value: "\(lat.rounded(to: 4)), \(lon.rounded(to: 4))")
+            }
+            if scan.isReported {
+                SCKeyValueRow(label: "Reported", value: "Yes")
+            } else {
+                SCKeyValueRow(label: "Reported", value: "Not yet")
+            }
+        }
+        .padding()
+        .scThemedCard()
+    }
+
+    private var safetyCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Disclaimer")
+                .font(.headline)
+            Text("ShelfCheck provides consumer education and evidence organization. It does not provide legal advice. If you need legal advice, consult an attorney.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            Button {
+                coordinator.openLegal(.disclaimer)
+            } label: {
+                Label("Read Full Disclaimer", systemImage: "hand.raised.fill")
+            }
+        }
+        .padding()
+        .scThemedCard()
+    }
+}
+
+struct SCReminderSheet: View {
+    let scan: SCStoredScan
+    @Binding var reminderDaysBefore: Int
+
+    @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject private var coordinator: SCAppCoordinator
+    @Query private var settings: [SCUserSettings]
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Reminder Timing") {
+                    Stepper(value: $reminderDaysBefore, in: 1...30) {
+                        Text("\(reminderDaysBefore) day(s) before")
+                    }
+                    .disabled(scan.decodedDate == nil)
+                }
+
+                Section("Preview") {
+                    if let exp = scan.decodedDate {
+                        let remindDate = Calendar.current.date(byAdding: .day, value: -reminderDaysBefore, to: exp) ?? exp
+                        Text("Will notify on \(remindDate.formatted(date: .long, time: .omitted))")
+                            .font(.subheadline)
+                    } else {
+                        Text("No decoded date. Scan a date first.")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .navigationTitle("Expiry Reminder")
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("Cancel") { dismiss() }
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Set") {
+                        guard let exp = scan.decodedDate else { return }
+                        let enabled = settings.first?.enableExpiryReminders ?? true
+                        if !enabled {
+                            coordinator.presentAlert(title: "Reminders Off", message: "Enable expiry reminders in Settings.")
+                            return
+                        }
+                        Task { await SCNotifications.requestAuthIfNeeded(coordinator: coordinator) }
+                        let remindDate = Calendar.current.date(byAdding: .day, value: -reminderDaysBefore, to: exp) ?? exp
+                        SCNotifications.scheduleExpiryReminder(scanId: scan.id, fireDate: remindDate, title: "ShelfCheck Reminder", body: "This item expires soon. Review your scan and take action.")
+                        coordinator.presentToast("Reminder scheduled", symbol: "bell.fill")
+                        dismiss()
+                    }
+                }
+            }
+        }
+    }
+}
+
+struct SCKeyValuePill: View {
+    let label: String
+    let value: String
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.caption.weight(.semibold))
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(.ultraThinMaterial)
+        .cornerRadius(12)
+    }
+}
+
+struct SCKeyValueRow: View {
+    let label: String
+    let value: String
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(label)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text(value)
+                .font(.subheadline)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(.vertical, 6)
+    }
+}
+
+extension Double {
+    func rounded(to places: Int) -> Double {
+        let divisor = pow(10.0, Double(places))
+        return (self * divisor).rounded() / divisor
+    }
+}
+
+// MARK: - (3) Report Wizard (Launcher + Full Flow)
+
+struct SCReportWizardLauncher: View {
+    @Environment(\.modelContext) private var modelContext
+    let scanId: UUID
+    @Query private var scans: [SCStoredScan]
+
+    init(scanId: UUID) {
+        self.scanId = scanId
+        _scans = Query(filter: #Predicate<SCStoredScan> { $0.id == scanId })
+    }
+
+    var body: some View {
+        if let scan = scans.first {
+            SCReportWizardView(scan: scan)
+        } else {
+            Text("Scan not found")
+                .padding()
+        }
+    }
+}
+
+struct SCReportWizardView: View {
+    let scan: SCStoredScan
+
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.modelContext) private var modelContext
+    @EnvironmentObject private var coordinator: SCAppCoordinator
+
+    @Query private var profiles: [SCUserProfile]
+    @Query private var settings: [SCUserSettings]
+
+    @State private var step: Int = 0
+
+    // Draft persistence
+    @State private var draft: SCReportDraft?
+
+    // Inputs
+    @State private var storeName: String = ""
+    @State private var storeAddress: String = ""
+    @State private var narrative: String = ""
+    @State private var resolution: String = "Refund and immediate removal of the product from shelves."
+    @State private var includeLocation: Bool = true
+
+    // Attachments
+    @State private var photoItems: [PhotosPickerItem] = []
+    @State private var pendingAttachments: [(String, String, Data)] = [] // (filename, mime, data)
+
+    // PDF + Share
+    @State private var isGenerating: Bool = false
+    @State private var pdfPreviewData: Data? = nil
+
+    // UI
+    @State private var showSubmitConfirm: Bool = false
+
+    var body: some View {
+        NavigationStack {
+            ZStack {
+                SCTheme.backgroundGradient(isDark: true).ignoresSafeArea()
+
+                VStack(spacing: 0) {
+                    progressHeader
+                    TabView(selection: $step) {
+                        stepStore.tag(0)
+                        stepNarrative.tag(1)
+                        stepAttachments.tag(2)
+                        stepPreview.tag(3)
+                    }
+                    .tabViewStyle(.page(indexDisplayMode: .never))
+                }
+
+                if isGenerating {
+                    SCLoadingOverlay(text: "Generating evidence pack…")
+                }
+            }
+            .navigationTitle("Report Wizard")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("Close") { dismiss() }
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Help") { coordinator.openLegal(.disclaimer) }
+                }
+            }
+            .onAppear {
+                ensureProfile()
+                loadOrCreateDraft()
+                hydrateFromDraft()
+                prefillNarrativeIfEmpty()
+            }
+            .onChange(of: photoItems) { _, newItems in
+                Task { await loadPhotosPickerItems(newItems) }
+            }
+            .alert("Submit Report?", isPresented: $showSubmitConfirm) {
+                Button("Cancel", role: .cancel) {}
+                Button("Mark Submitted") {
+                    markSubmittedAndUpdateStoreSignal()
+                }
+            } message: {
+                Text("This will mark the report as submitted and update the community map signal for the store.")
+            }
+        }
+    }
+
+    private var progressHeader: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Step \(step + 1) of 4")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            ProgressView(value: Double(step + 1), total: 4)
+                .tint(SCTheme.justiceRed)
+
+            HStack {
+                Text(stepTitle)
+                    .font(.headline.weight(.bold))
+                Spacer()
+                Text(scan.status.rawValue)
+                    .font(.caption.weight(.bold))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(scan.status.color.opacity(0.25))
+                    .foregroundStyle(scan.status.color)
+                    .cornerRadius(12)
+            }
+        }
+        .padding()
+        .background(.ultraThinMaterial)
+    }
+
+    private var stepTitle: String {
+        switch step {
+        case 0: return "Store & Location"
+        case 1: return "What Happened"
+        case 2: return "Attachments"
+        default: return "Evidence Pack"
+        }
+    }
+
+    // Step 0
+    private var stepStore: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                Group {
+                    Text("Store Name")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    TextField("Ex: Corner Market", text: $storeName)
+                        .textFieldStyle(.roundedBorder)
+
+                    Text("Store Address (optional but strongly recommended)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    TextField("Street, City, State", text: $storeAddress)
+                        .textFieldStyle(.roundedBorder)
+
+                    Toggle(isOn: $includeLocation) {
+                        Label("Attach approximate scan location", systemImage: "location.fill")
+                    }
+                }
+                .padding()
+                .scThemedCard()
+
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Why this matters")
+                        .font(.headline)
+                    Text("Reports without store info are weak. The goal is accountability, not vibes.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+                .padding()
+                .scThemedCard()
+
+                HStack(spacing: 10) {
+                    Button {
+                        step = min(step + 1, 3)
+                        persistDraft()
+                    } label: {
+                        Text("Next")
+                            .font(.headline.weight(.bold))
+                            .frame(maxWidth: .infinity)
+                            .padding()
+                            .background(SCTheme.justiceRed)
+                            .foregroundStyle(.white)
+                            .cornerRadius(14)
+                    }
+                }
+                .padding(.top, 6)
+            }
+            .padding()
+        }
+    }
+
+    // Step 1
+    private var stepNarrative: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Describe what happened")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    TextEditor(text: $narrative)
+                        .frame(minHeight: 160)
+                        .padding(10)
+                        .background(.black.opacity(0.15))
+                        .cornerRadius(12)
+
+                    Text("Requested resolution")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    TextEditor(text: $resolution)
+                        .frame(minHeight: 100)
+                        .padding(10)
+                        .background(.black.opacity(0.15))
+                        .cornerRadius(12)
+                }
+                .padding()
+                .scThemedCard()
+
+                HStack(spacing: 10) {
+                    Button {
+                        step = max(step - 1, 0)
+                        persistDraft()
+                    } label: {
+                        Text("Back")
+                            .frame(maxWidth: .infinity)
+                            .padding()
+                            .background(.gray.opacity(0.25))
+                            .cornerRadius(14)
+                    }
+
+                    Button {
+                        step = min(step + 1, 3)
+                        persistDraft()
+                    } label: {
+                        Text("Next")
+                            .font(.headline.weight(.bold))
+                            .frame(maxWidth: .infinity)
+                            .padding()
+                            .background(SCTheme.justiceRed)
+                            .foregroundStyle(.white)
+                            .cornerRadius(14)
+                    }
+                }
+                .padding(.top, 6)
+            }
+            .padding()
+        }
+    }
+
+    // Step 2
+    private var stepAttachments: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Add photos")
+                        .font(.headline)
+                    Text("Best attachments: shelf photo, label close-up, receipt, store entrance sign.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+
+                    PhotosPicker(selection: $photoItems, maxSelectionCount: 6, matching: .images) {
+                        Label("Choose Photos", systemImage: "photo.on.rectangle.angled")
+                            .frame(maxWidth: .infinity)
+                            .padding()
+                            .background(SCTheme.truthBlue)
+                            .foregroundStyle(.white)
+                            .cornerRadius(14)
+                    }
+
+                    if pendingAttachments.isEmpty {
+                        Text("No attachments yet.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .padding(.top, 6)
+                    } else {
+                        VStack(alignment: .leading, spacing: 8) {
+                            ForEach(Array(pendingAttachments.enumerated()), id: \.offset) { idx, att in
+                                HStack {
+                                    Image(systemName: "paperclip")
+                                    Text(att.0)
+                                        .lineLimit(1)
+                                    Spacer()
+                                    Button(role: .destructive) {
+                                        pendingAttachments.remove(at: idx)
+                                    } label: {
+                                        Image(systemName: "trash")
+                                    }
+                                }
+                                .font(.subheadline)
+                                .padding(.vertical, 4)
+                            }
+                        }
+                        .padding(.top, 8)
+                    }
+                }
+                .padding()
+                .scThemedCard()
+
+                HStack(spacing: 10) {
+                    Button {
+                        step = max(step - 1, 0)
+                        persistDraft()
+                    } label: {
+                        Text("Back")
+                            .frame(maxWidth: .infinity)
+                            .padding()
+                            .background(.gray.opacity(0.25))
+                            .cornerRadius(14)
+                    }
+
+                    Button {
+                        step = min(step + 1, 3)
+                        persistDraft()
+                    } label: {
+                        Text("Next")
+                            .font(.headline.weight(.bold))
+                            .frame(maxWidth: .infinity)
+                            .padding()
+                            .background(SCTheme.justiceRed)
+                            .foregroundStyle(.white)
+                            .cornerRadius(14)
+                    }
+                }
+                .padding(.top, 6)
+            }
+            .padding()
+        }
+    }
+
+    // Step 3
+    private var stepPreview: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("Evidence Pack")
+                        .font(.headline)
+                    Text("This generates a single PDF you can share with a store manager, agency, or keep for your records.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+
+                    Button {
+                        Task { await generateEvidencePack() }
+                    } label: {
+                        Label("Generate / Refresh PDF", systemImage: "doc.fill")
+                            .frame(maxWidth: .infinity)
+                            .padding()
+                            .background(SCTheme.justiceRed)
+                            .foregroundStyle(.white)
+                            .cornerRadius(14)
+                    }
+
+                    if let pdfPreviewData, let doc = PDFDocument(data: pdfPreviewData) {
+                        SCPDFPreview(document: doc)
+                            .frame(height: 360)
+                            .clipShape(RoundedRectangle(cornerRadius: 16))
+                            .padding(.top, 8)
+
+                        HStack(spacing: 10) {
+                            Button {
+                                coordinator.share([pdfPreviewData])
+                            } label: {
+                                Label("Share PDF", systemImage: "square.and.arrow.up")
+                                    .frame(maxWidth: .infinity)
+                                    .padding()
+                                    .background(SCTheme.truthBlue)
+                                    .foregroundStyle(.white)
+                                    .cornerRadius(14)
+                            }
+
+                            Button {
+                                showSubmitConfirm = true
+                            } label: {
+                                Label("Mark Submitted", systemImage: "checkmark.seal.fill")
+                                    .frame(maxWidth: .infinity)
+                                    .padding()
+                                    .background(.green.opacity(0.85))
+                                    .foregroundStyle(.white)
+                                    .cornerRadius(14)
+                            }
+                        }
+                        .padding(.top, 8)
+                    } else {
+                        Text("No PDF generated yet.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .padding(.top, 6)
+                    }
+
+                    Button {
+                        coordinator.openLegal(.disclaimer)
+                    } label: {
+                        Label("Read Disclaimer", systemImage: "hand.raised.fill")
+                    }
+                    .padding(.top, 4)
+                }
+                .padding()
+                .scThemedCard()
+
+                HStack(spacing: 10) {
+                    Button {
+                        step = max(step - 1, 0)
+                        persistDraft()
+                    } label: {
+                        Text("Back")
+                            .frame(maxWidth: .infinity)
+                            .padding()
+                            .background(.gray.opacity(0.25))
+                            .cornerRadius(14)
+                    }
+
+                    Button {
+                        persistDraft()
+                        coordinator.presentToast("Draft saved", symbol: "square.and.arrow.down.fill")
+                        dismiss()
+                    } label: {
+                        Text("Save & Close")
+                            .font(.headline.weight(.bold))
+                            .frame(maxWidth: .infinity)
+                            .padding()
+                            .background(.black.opacity(0.35))
+                            .foregroundStyle(.white)
+                            .cornerRadius(14)
+                    }
+                }
+            }
+            .padding()
+        }
+    }
+
+    // MARK: - Draft wiring
+
+    private func ensureProfile() {
+        if profiles.isEmpty {
+            modelContext.insert(SCUserProfile())
+        }
+        if settings.isEmpty {
+            modelContext.insert(SCUserSettings())
+        }
+    }
+
+    private func loadOrCreateDraft() {
+        if let existingId = scan.reportDraftId {
+            // Load existing draft
+            let fetch = FetchDescriptor<SCReportDraft>(predicate: #Predicate { $0.id == existingId })
+            if let existing = try? modelContext.fetch(fetch).first {
+                draft = existing
+                return
+            }
+        }
+
+        // Create new draft
+        let d = SCReportDraft(scanId: scan.id)
+        modelContext.insert(d)
+        scan.reportDraftId = d.id
+        draft = d
+        saveContext()
+    }
+
+    private func hydrateFromDraft() {
+        guard let d = draft else { return }
+        storeName = d.storeName
+        storeAddress = d.storeAddress
+        narrative = d.narrative
+        resolution = d.requestedResolution
+        if let pdf = d.evidencePDFData { pdfPreviewData = pdf }
+
+        // Mirror attachments
+        pendingAttachments = d.attachments.map { ($0.filename, $0.mime, $0.data) }
+    }
+
+    private func prefillNarrativeIfEmpty() {
+        if !narrative.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return }
+
+        var parts: [String] = []
+        parts.append("I scanned a product label/lot code that ShelfCheck flagged as \(scan.status.rawValue).")
+        if let date = scan.decodedDate {
+            parts.append("Decoded date: \(date.formatted(date: .long, time: .omitted)).")
+        }
+        parts.append("The product appears to be offered for sale despite this.")
+        parts.append("Please review the evidence and take immediate corrective action.")
+
+        narrative = parts.joined(separator: " ")
+    }
+
+    private func persistDraft() {
+        guard let d = draft else { return }
+        d.updatedAt = Date()
+        d.storeName = storeName.trimmingCharacters(in: .whitespacesAndNewlines)
+        d.storeAddress = storeAddress.trimmingCharacters(in: .whitespacesAndNewlines)
+        d.narrative = narrative.trimmingCharacters(in: .whitespacesAndNewlines)
+        d.requestedResolution = resolution.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // Replace attachment models
+        d.attachments.forEach { modelContext.delete($0) }
+        d.attachments.removeAll()
+
+        for att in pendingAttachments {
+            let model = SCAttachment(filename: att.0, mime: att.1, data: att.2, reportDraft: d)
+            modelContext.insert(model)
+            d.attachments.append(model)
+        }
+
+        saveContext()
+    }
+
+    private func saveContext() {
+        do { try modelContext.save() } catch { /* no crash */ }
+    }
+
+    // MARK: - Attachment loading
+
+    private func loadPhotosPickerItems(_ items: [PhotosPickerItem]) async {
+        var newOnes: [(String, String, Data)] = []
+        for (idx, item) in items.enumerated() {
+            if let data = try? await item.loadTransferable(type: Data.self) {
+                let name = "photo-\(idx + 1).jpg"
+                newOnes.append((name, "image/jpeg", data))
+            }
+        }
+        await MainActor.run {
+            // keep unique-ish by data hash
+            for att in newOnes {
+                if pendingAttachments.contains(where: { $0.2 == att.2 }) == false {
+                    pendingAttachments.append(att)
+                }
+            }
+            persistDraft()
+        }
+    }
+
+    // MARK: - Evidence Pack PDF
+
+    private func generateEvidencePack() async {
+        await MainActor.run { isGenerating = true }
+        defer { Task { @MainActor in isGenerating = false } }
+
+        persistDraft()
+
+        guard let d = draft else { return }
+
+        // location
+        let locText: String = {
+            if includeLocation, let lat = scan.locationLat, let lon = scan.locationLong {
+                return "\(lat.rounded(to: 4)), \(lon.rounded(to: 4))"
+            }
+            return "Not included"
+        }()
+
+        let profile = profiles.first ?? SCUserProfile()
+        let anonymous = profile.preferAnonymous
+
+        // Build plain report text (will be embedded into PDF)
+        var lines: [String] = []
+        lines.append("SHELFCHECK — EVIDENCE PACK")
+        lines.append("Generated: \(Date().formatted(date: .long, time: .shortened))")
+        lines.append("")
+        lines.append("STATUS: \(scan.status.rawValue)")
+        lines.append("WHY: \(scan.status.quickWhy)")
+        lines.append("")
+        lines.append("SCAN RAW:")
+        lines.append(scan.rawText)
+        lines.append("")
+        if let date = scan.decodedDate {
+            lines.append("DECODED DATE: \(date.formatted(date: .long, time: .omitted))")
+            lines.append("FORMAT: \(scan.decodeFormatUsed)")
+            lines.append("CONFIDENCE: \(Int((scan.decodeConfidence * 100).rounded()))%")
+            if let m = scan.matchedSubstring { lines.append("MATCHED: \(m)") }
+            lines.append("")
+        }
+        lines.append("STORE:")
+        lines.append("Name: \(d.storeName.isEmpty ? "(not provided)" : d.storeName)")
+        lines.append("Address: \(d.storeAddress.isEmpty ? "(not provided)" : d.storeAddress)")
+        lines.append("Location: \(locText)")
+        lines.append("")
+        lines.append("WHAT HAPPENED:")
+        lines.append(d.narrative.isEmpty ? "(not provided)" : d.narrative)
+        lines.append("")
+        lines.append("REQUESTED RESOLUTION:")
+        lines.append(d.requestedResolution.isEmpty ? "(not provided)" : d.requestedResolution)
+        lines.append("")
+        lines.append("REPORTER:")
+        if anonymous {
+            lines.append("Anonymous (user chose not to include personal info)")
+        } else {
+            lines.append("Name: \(profile.displayName)")
+            lines.append("Email: \(profile.email)")
+            lines.append("Phone: \(profile.phone)")
+            lines.append("City/ZIP: \(profile.city) \(profile.zip)")
+        }
+        lines.append("")
+        lines.append("DISCLAIMER:")
+        lines.append("ShelfCheck provides consumer education and evidence organization. Not legal advice.")
+
+        let textBlock = lines.joined(separator: "\n")
+
+        // Render PDF (text + thumbnails)
+        let pdfData = SCEvidencePackPDF.buildPDF(
+            title: "ShelfCheck Evidence Pack",
+            bodyText: textBlock,
+            attachments: pendingAttachments
+        )
+
+        await MainActor.run {
+            pdfPreviewData = pdfData
+            d.evidencePDFData = pdfData
+            d.updatedAt = Date()
+            saveContext()
+            coordinator.presentToast("Evidence pack generated", symbol: "doc.fill")
+        }
+    }
+
+    // MARK: - Submit: update scan + store map signal
+
+    private func markSubmittedAndUpdateStoreSignal() {
+        persistDraft()
+        guard let d = draft else { return }
+
+        d.isSubmitted = true
+        d.submittedAt = Date()
+        scan.isReported = true
+
+        // Store signal (5): create/increment flagged store if actionable status
+        if scan.status == .expired || scan.status == .misbranded || scan.status == .recalled {
+            SCStoreSignal.upsertFlaggedStore(
+                modelContext: modelContext,
+                storeName: d.storeName,
+                storeAddress: d.storeAddress,
+                lat: scan.locationLat,
+                lon: scan.locationLong
+            )
+        }
+
+        saveContext()
+        coordinator.presentToast("Marked submitted + updated map", symbol: "checkmark.seal.fill")
+        dismiss()
+    }
+}
+
+struct SCLoadingOverlay: View {
+    let text: String
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.45).ignoresSafeArea()
+            VStack(spacing: 12) {
+                ProgressView()
+                Text(text)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.white)
+            }
+            .padding()
+            .background(.black.opacity(0.75))
+            .cornerRadius(16)
+        }
+    }
+}
+
+// MARK: - (3) PDF Builder
+
+enum SCEvidencePackPDF {
+    static func buildPDF(title: String, bodyText: String, attachments: [(String, String, Data)]) -> Data {
+        let page = CGRect(x: 0, y: 0, width: 612, height: 792) // US Letter @ 72dpi
+        let renderer = UIGraphicsPDFRenderer(bounds: page)
+
+        let data = renderer.pdfData { ctx in
+            ctx.beginPage()
+            var y: CGFloat = 36
+
+            func draw(_ str: String, font: UIFont, color: UIColor = .black) {
+                let attrs: [NSAttributedString.Key: Any] = [
+                    .font: font,
+                    .foregroundColor: color
+                ]
+                let maxRect = CGRect(x: 36, y: y, width: page.width - 72, height: page.height - 72)
+                let rect = (str as NSString).boundingRect(with: maxRect.size, options: [.usesLineFragmentOrigin, .usesFontLeading], attributes: attrs, context: nil)
+                (str as NSString).draw(in: CGRect(x: 36, y: y, width: maxRect.width, height: rect.height), withAttributes: attrs)
+                y += rect.height + 10
+            }
+
+            draw(title, font: .boldSystemFont(ofSize: 22), color: UIColor(SCTheme.justiceRed))
+            draw(bodyText, font: .systemFont(ofSize: 11))
+
+            // Attachments thumbnails (if images)
+            if !attachments.isEmpty {
+                if y > page.height - 220 {
+                    ctx.beginPage()
+                    y = 36
+                }
+                draw("ATTACHMENTS (thumbnails)", font: .boldSystemFont(ofSize: 14), color: UIColor.darkGray)
+
+                let thumbSize = CGSize(width: 160, height: 120)
+                var x: CGFloat = 36
+                var rowMaxH: CGFloat = 0
+
+                for (name, mime, data) in attachments {
+                    if mime.contains("image"), let img = UIImage(data: data) {
+                        if x + thumbSize.width > page.width - 36 {
+                            x = 36
+                            y += rowMaxH + 18
+                            rowMaxH = 0
+                        }
+                        if y + thumbSize.height > page.height - 36 {
+                            ctx.beginPage()
+                            y = 36
+                            x = 36
+                            rowMaxH = 0
+                        }
+
+                        let rect = CGRect(x: x, y: y, width: thumbSize.width, height: thumbSize.height)
+                        img.draw(in: rect)
+
+                        let cap = "\(name)"
+                        let attrs: [NSAttributedString.Key: Any] = [
+                            .font: UIFont.systemFont(ofSize: 9),
+                            .foregroundColor: UIColor.darkGray
+                        ]
+                        (cap as NSString).draw(in: CGRect(x: x, y: y + thumbSize.height + 2, width: thumbSize.width, height: 12), withAttributes: attrs)
+
+                        rowMaxH = max(rowMaxH, thumbSize.height + 14)
+                        x += thumbSize.width + 14
+                    } else {
+                        // Non-image: list it
+                        draw("• \(name) (\(mime))", font: .systemFont(ofSize: 11), color: UIColor.darkGray)
+                    }
+                }
+            }
+        }
+
+        return data
+    }
+}
+
+// MARK: - (5) Store Signal Pipeline
+
+enum SCStoreSignal {
+    static func upsertFlaggedStore(
+        modelContext: ModelContext,
+        storeName: String,
+        storeAddress: String,
+        lat: Double?,
+        lon: Double?
+    ) {
+        let name = storeName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let addr = storeAddress.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !name.isEmpty else { return }
+
+        // If no coordinates, we still store but map may be limited.
+        let latitude = lat ?? 42.3314
+        let longitude = lon ?? -83.0458
+
+        let fetch = FetchDescriptor<SCFlaggedStore>(predicate: #Predicate {
+            $0.name == name && $0.address == addr
+        })
+
+        if let existing = try? modelContext.fetch(fetch).first {
+            existing.violationCount += 1
+            existing.lastViolationDate = Date()
+        } else {
+            let store = SCFlaggedStore(name: name, address: addr.isEmpty ? "(address not provided)" : addr, lat: latitude, long: longitude)
+            modelContext.insert(store)
+        }
+
+        try? modelContext.save()
+    }
+}
+
+// MARK: - History View (with Scan Detail continuity)
+
+struct HistoryView: View {
+    @Query(sort: \SCStoredScan.timestamp, order: .reverse) private var scans: [SCStoredScan]
+    @AppStorage("isDarkMode") private var isDarkMode = true
+    @Environment(\.modelContext) private var modelContext
+    @EnvironmentObject private var coordinator: SCAppCoordinator
+
+    @State private var search: String = ""
+    @State private var filter: SCScanStatus? = nil
+    @State private var showUndo: Bool = false
+    @State private var lastDeleted: SCStoredScan? = nil
+
+    private var filteredScans: [SCStoredScan] {
+        var items = scans
+        if let filter { items = items.filter { $0.status == filter } }
+        if !search.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let s = search.lowercased()
+            items = items.filter { $0.rawText.lowercased().contains(s) || ($0.storeName ?? "").lowercased().contains(s) }
+        }
+        return items
+    }
+
+    var body: some View {
+        NavigationStack {
+            ZStack {
+                SCTheme.backgroundGradient(isDark: isDarkMode).ignoresSafeArea()
+
+                VStack(spacing: 0) {
+                    filterBar
+                    if filteredScans.isEmpty {
+                        emptyStateView
+                    } else {
+                        scansList
+                    }
+                }
+            }
+            .navigationTitle("Scan History")
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        filter = nil
+                        search = ""
+                    } label: {
+                        Image(systemName: "line.3.horizontal.decrease.circle")
+                    }
+                    .accessibilityLabel("Clear filters")
+                }
+            }
+            .overlay(alignment: .bottom) {
+                if showUndo {
+                    undoBanner
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                        .padding(.bottom, 12)
+                }
+            }
+        }
+    }
+
+    private var filterBar: some View {
+        VStack(spacing: 10) {
+            HStack {
+                Image(systemName: "magnifyingglass")
+                    .foregroundStyle(.secondary)
+                TextField("Search scans or stores", text: $search)
+                    .textFieldStyle(.plain)
+            }
+            .padding(10)
+            .background(.ultraThinMaterial)
+            .cornerRadius(14)
+            .padding(.horizontal)
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 10) {
+                    SCFilterChip(title: "All", isOn: filter == nil) { filter = nil }
+                    ForEach([SCScanStatus.expired, .warning, .misbranded, .recalled, .fresh], id: \.self) { st in
+                        SCFilterChip(title: st.rawValue, isOn: filter == st, color: st.color) { filter = st }
+                    }
+                }
+                .padding(.horizontal)
+                .padding(.bottom, 10)
+            }
+        }
+        .padding(.top, 10)
+    }
+
+    private var emptyStateView: some View {
+        VStack(spacing: 16) {
+            Image(systemName: "clock.arrow.circlepath")
+                .font(.system(size: 50))
+                .foregroundStyle(.secondary)
+            Text("No Scans Yet")
+                .font(.headline)
+            Text("Your scan history will appear here. Tap a scan for details and actions.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var scansList: some View {
+        List {
+            ForEach(filteredScans) { scan in
+                Button {
+                    coordinator.openScanDetail(scanId: scan.id)
+                } label: {
+                    HStack(spacing: 12) {
+                        Image(systemName: scan.status.icon)
+                            .foregroundStyle(scan.status.color)
+                            .font(.title2)
+                            .frame(width: 30)
+
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(scan.status.rawValue)
+                                .font(.headline)
+                            Text(scan.rawText)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+
+                            if let date = scan.decodedDate {
+                                Text("Decoded: \(date.formatted(date: .abbreviated, time: .omitted)) · \(Int((scan.decodeConfidence * 100).rounded()))%")
+                                    .font(.caption2)
+                                    .foregroundStyle(scan.status.color)
+                            }
+                        }
+
+                        Spacer()
+
+                        Image(systemName: "chevron.right")
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.vertical, 6)
+                }
+                .listRowBackground(SCTheme.cardBackground(isDark: isDarkMode))
+            }
+            .onDelete(perform: deleteScans)
+        }
+        .scrollContentBackground(.hidden)
+    }
+
+    private func deleteScans(at offsets: IndexSet) {
+        for index in offsets {
+            lastDeleted = filteredScans[index]
+            modelContext.delete(filteredScans[index])
+        }
+        try? modelContext.save()
+        withAnimation { showUndo = true }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
+            withAnimation { showUndo = false }
+        }
+    }
+
+    private var undoBanner: some View {
+        HStack {
+            Text("Scan deleted")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.white)
+            Spacer()
+            Button("Undo") {
+                if let scan = lastDeleted {
+                    modelContext.insert(scan)
+                    try? modelContext.save()
+                }
+                withAnimation { showUndo = false }
+            }
+            .font(.subheadline.weight(.bold))
+            .foregroundStyle(.white)
+        }
+        .padding()
+        .background(.black.opacity(0.85))
+        .cornerRadius(14)
+        .padding(.horizontal)
+    }
+}
+
+struct SCFilterChip: View {
+    let title: String
+    let isOn: Bool
+    var color: Color = .white
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Text(title)
+                .font(.caption.weight(.semibold))
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(isOn ? color.opacity(0.22) : .gray.opacity(0.15))
+                .foregroundStyle(isOn ? color : .secondary)
+                .cornerRadius(999)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 999)
+                        .stroke(isOn ? color.opacity(0.40) : .clear, lineWidth: 1)
+                )
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+// MARK: - (5) Heatmap Map View (Real Map + Pins + Store Detail)
+
+struct HeatmapView: View {
+    @AppStorage("isDarkMode") private var isDarkMode = true
+    @Query(sort: \SCFlaggedStore.violationCount, order: .reverse) private var flaggedStores: [SCFlaggedStore]
+    @StateObject private var loc = SCLocationManager.shared
+
+    @State private var region = MKCoordinateRegion(
+        center: CLLocationCoordinate2D(latitude: 42.3314, longitude: -83.0458), // Detroit default
+        span: MKCoordinateSpan(latitudeDelta: 0.10, longitudeDelta: 0.10)
+    )
+
+    var body: some View {
+        NavigationStack {
+            ZStack {
+                SCTheme.backgroundGradient(isDark: isDarkMode).ignoresSafeArea()
+
+                VStack(spacing: 0) {
+                    Map(coordinateRegion: $region, annotationItems: flaggedStores) { store in
+                        MapAnnotation(coordinate: CLLocationCoordinate2D(latitude: store.latitude, longitude: store.longitude)) {
+                            NavigationLink(destination: SCStoreDetailView(store: store)) {
+                                VStack(spacing: 2) {
+                                    Image(systemName: "mappin.circle.fill")
+                                        .font(.title)
+                                        .foregroundStyle(SCTheme.justiceRed)
+                                    Text("\(store.violationCount)")
+                                        .font(.caption2.weight(.bold))
+                                        .foregroundStyle(.white)
+                                        .padding(.horizontal, 6)
+                                        .padding(.vertical, 2)
+                                        .background(.black.opacity(0.75))
+                                        .cornerRadius(10)
+                                }
+                            }
+                        }
+                    }
+                    .frame(height: 360)
+                    .clipShape(RoundedRectangle(cornerRadius: 18))
+                    .padding()
+
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("Community Signal")
+                            .font(.headline.weight(.bold))
+
+                        Text("Pins are stores with community reports marked submitted (expired/misbranded/recalled). Tap a pin for details.")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+
+                        if flaggedStores.isEmpty {
+                            Text("No flagged stores yet. Submit a report to light up the map.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .padding(.top, 6)
+                        } else {
+                            ScrollView(.horizontal, showsIndicators: false) {
+                                HStack(spacing: 12) {
+                                    ForEach(flaggedStores.prefix(10)) { store in
+                                        NavigationLink(destination: SCStoreDetailView(store: store)) {
+                                            VStack(alignment: .leading, spacing: 6) {
+                                                Text(store.name)
+                                                    .font(.subheadline.weight(.semibold))
+                                                    .foregroundStyle(.primary)
+                                                    .lineLimit(1)
+                                                Text(store.address)
+                                                    .font(.caption2)
+                                                    .foregroundStyle(.secondary)
+                                                    .lineLimit(1)
+                                                Text("Violations: \(store.violationCount)")
+                                                    .font(.caption2.weight(.bold))
+                                                    .foregroundStyle(SCTheme.justiceRed)
+                                            }
+                                            .padding(12)
+                                            .background(.ultraThinMaterial)
+                                            .cornerRadius(14)
+                                        }
+                                        .buttonStyle(.plain)
+                                    }
+                                }
+                                .padding(.horizontal)
+                            }
+                            .padding(.top, 6)
+                        }
+                    }
+                    .padding()
+                    .scThemedCard()
+
+                    Spacer(minLength: 0)
+                }
+            }
+            .navigationTitle("Map")
+            .onAppear {
+                loc.requestWhenInUse()
+                loc.start()
+                if let l = loc.lastKnownLocation {
+                    region.center = l.coordinate
+                }
+            }
+        }
+    }
+}
+
+struct SCStoreDetailView: View {
+    let store: SCFlaggedStore
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text(store.name)
+                        .font(.title2.weight(.bold))
+                    Text(store.address)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+
+                    HStack(spacing: 10) {
+                        SCKeyValuePill(label: "Violations", value: "\(store.violationCount)")
+                        SCKeyValuePill(label: "Last", value: store.lastViolationDate.formatted(date: .abbreviated, time: .omitted))
+                    }
+                }
+                .padding()
+                .scThemedCard(glow: SCTheme.justiceRed)
+
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("What to do")
+                        .font(.headline)
+                    Text("If you shop here: scan lot codes, photograph shelves, and submit a report when you find violations. Strong evidence changes behavior.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+                .padding()
+                .scThemedCard()
+            }
+            .padding()
+        }
+        .navigationTitle("Store")
+        .navigationBarTitleDisplayMode(.inline)
+        .background(SCTheme.backgroundGradient(isDark: true))
+    }
+}
+
+// MARK: - Resources View
+
+struct ResourcesView: View {
+    @AppStorage("isDarkMode") private var isDarkMode = true
+    @EnvironmentObject private var coordinator: SCAppCoordinator
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    Text("Know Your Rights")
+                        .font(.largeTitle.weight(.bold))
+
+                    Text("Food safety enforcement works best when consumers can document violations clearly and consistently.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+
+                    SCResourceCard(
+                        title: "Michigan Consumer Protection Act",
+                        code: "MCL 445.903",
+                        desc: "Protects consumers against deceptive trade practices including the sale of expired or mislabeled food products.",
+                        icon: "shield.checkered"
+                    )
+
+                    SCResourceCard(
+                        title: "Food Law of 2000",
+                        code: "MCL 289.5101",
+                        desc: "Regulates food safety, adulteration, and labeling requirements for food sold in Michigan.",
+                        icon: "leaf.fill"
+                    )
+
+                    SCResourceCard(
+                        title: "Baby Formula Protections",
+                        code: "Federal",
+                        desc: "Selling infant formula past the 'Use By' date is illegal. This is the only federally mandated expiration date.",
+                        icon: "heart.fill"
+                    )
+
+                    SCResourceCard(
+                        title: "UCC Implied Warranty",
+                        code: "UCC 2-314",
+                        desc: "Goods must be fit for ordinary purposes. Expired products can violate merchantability.",
+                        icon: "checkmark.seal.fill"
+                    )
+
+                    SCResourceCard(
+                        title: "Bulk Break Violations",
+                        code: "21 CFR 101.9",
+                        desc: "'Not For Individual Sale' items sold separately can violate federal labeling rules.",
+                        icon: "xmark.octagon.fill"
+                    )
+
+                    Button {
+                        coordinator.openURL(SCLinks.openFDAInfoURL)
+                    } label: {
+                        Label("Learn about recalls data (openFDA)", systemImage: "link")
+                            .frame(maxWidth: .infinity)
+                            .padding()
+                            .background(SCTheme.truthBlue)
+                            .foregroundStyle(.white)
+                            .cornerRadius(14)
+                    }
+                }
+                .padding()
+            }
+            .background(SCTheme.backgroundGradient(isDark: isDarkMode))
+            .navigationTitle("Rights")
+        }
+    }
+}
+
+struct SCResourceCard: View {
+    let title: String
+    let code: String
+    let desc: String
+    let icon: String
+    @AppStorage("isDarkMode") private var isDarkMode = true
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Image(systemName: icon)
+                    .foregroundStyle(SCTheme.truthBlue)
+                    .font(.title2)
+                Text(title)
+                    .font(.headline)
+                    .foregroundStyle(SCTheme.truthBlue)
+            }
+
+            Text(code)
+                .font(.caption.weight(.bold))
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(SCTheme.truthBlue.opacity(0.2))
+                .foregroundStyle(SCTheme.truthBlue)
+                .cornerRadius(4)
+
+            Text(desc)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+        }
+        .padding()
+        .scThemedCard()
+    }
+}
+
+// MARK: - (6) Settings View — Real links, legal screens, profile, recall sync
+
+struct SettingsView: View {
+    @AppStorage("isDarkMode") private var isDarkMode = true
+    @AppStorage("hasCompletedOnboarding") private var hasCompletedOnboarding = true
+
+    @Environment(\.modelContext) private var modelContext
+    @EnvironmentObject private var coordinator: SCAppCoordinator
+
+    @Query private var settings: [SCUserSettings]
+    @Query private var profiles: [SCUserProfile]
+    @Query private var recalls: [SCRecallAlert]
+
+    @State private var syncing: Bool = false
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section("Profile (Templates)") {
+                    NavigationLink {
+                        SCProfileView()
+                    } label: {
+                        Label("Your Info Template", systemImage: "person.crop.circle.fill")
+                    }
+
+                    Text("This pre-fills reports and evidence packs. Keep it anonymous if you prefer.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .listRowBackground(Color.clear)
+                }
+
+                Section("Appearance") {
+                    Toggle(isOn: $isDarkMode) {
+                        Label("Dark Mode", systemImage: "moon.fill")
+                    }
+                }
+
+                Section("Notifications") {
+                    Toggle(isOn: bindingSettings(\.enableRecallNotifications, defaultValue: true)) {
+                        Label("Recall Alerts", systemImage: "exclamationmark.octagon.fill")
+                    }
+                    Toggle(isOn: bindingSettings(\.enableExpiryReminders, defaultValue: true)) {
+                        Label("Expiry Reminders", systemImage: "bell.fill")
+                    }
+
+                    Button {
+                        Task { await SCNotifications.requestAuthIfNeeded(coordinator: coordinator) }
+                    } label: {
+                        Label("Enable Notifications", systemImage: "checkmark.circle")
+                    }
+                }
+
+                Section("Recalls (Sync)") {
+                    HStack {
+                        Label("Cached recalls", systemImage: "archivebox.fill")
+                        Spacer()
+                        Text("\(recalls.count)")
+                            .foregroundStyle(.secondary)
+                    }
+
+                    Button {
+                        Task { await syncRecallsNow() }
+                    } label: {
+                        if syncing {
+                            Label("Syncing…", systemImage: "arrow.triangle.2.circlepath")
+                        } else {
+                            Label("Sync Recalls Now", systemImage: "arrow.triangle.2.circlepath")
+                        }
+                    }
+                    .disabled(syncing)
+                }
+
+                Section("Legal") {
+                    Button {
+                        coordinator.openLegal(.privacy)
+                    } label: {
+                        Label("Privacy Policy", systemImage: "hand.raised.fill")
+                    }
+
+                    Button {
+                        coordinator.openLegal(.terms)
+                    } label: {
+                        Label("Terms of Service", systemImage: "doc.text.fill")
+                    }
+
+                    Button {
+                        coordinator.openLegal(.disclaimer)
+                    } label: {
+                        Label("Disclaimer", systemImage: "exclamationmark.triangle.fill")
+                    }
+                }
+
+                Section("Websites") {
+                    Button {
+                        coordinator.openURL(SCLinks.privacyURL)
+                    } label: {
+                        Label("Open Privacy Website", systemImage: "safari.fill")
+                    }
+                    Button {
+                        coordinator.openURL(SCLinks.termsURL)
+                    } label: {
+                        Label("Open Terms Website", systemImage: "safari.fill")
+                    }
+                }
+
+                Section("Debug") {
+                    Button(role: .destructive) {
+                        hasCompletedOnboarding = false
+                    } label: {
+                        Label("Reset Onboarding", systemImage: "arrow.counterclockwise")
+                    }
+
+                    Button(role: .destructive) {
+                        // hard clear recalls for testing
+                        for r in recalls { modelContext.delete(r) }
+                        try? modelContext.save()
+                        coordinator.presentToast("Recalls cleared", symbol: "trash.fill")
+                    } label: {
+                        Label("Clear Cached Recalls", systemImage: "trash")
+                    }
+                }
+
+                Section("About") {
+                    HStack {
+                        Label("Version", systemImage: "info.circle")
+                        Spacer()
+                        Text("1.0.0")
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .scrollContentBackground(.hidden)
+            .background(SCTheme.backgroundGradient(isDark: isDarkMode))
+            .navigationTitle("Settings")
+            .onAppear {
+                ensureSettingsAndProfile()
+            }
+        }
+    }
+
+    private func ensureSettingsAndProfile() {
+        if settings.isEmpty { modelContext.insert(SCUserSettings()) }
+        if profiles.isEmpty { modelContext.insert(SCUserProfile()) }
+        try? modelContext.save()
+    }
+
+    private func bindingSettings(_ keyPath: ReferenceWritableKeyPath<SCUserSettings, Bool>, defaultValue: Bool) -> Binding<Bool> {
+        Binding(
+            get: { settings.first?[keyPath: keyPath] ?? defaultValue },
+            set: { newValue in
+                ensureSettingsAndProfile()
+                settings.first?[keyPath: keyPath] = newValue
+                try? modelContext.save()
+            }
+        )
+    }
+
+    private func syncRecallsNow() async {
+        await MainActor.run { syncing = true }
+        defer { Task { @MainActor in syncing = false } }
+
+        do {
+            let results = try await SCRecallService.fetchRecentRecalls(limit: 30)
+            await MainActor.run {
+                SCRecallService.upsertRecalls(results, modelContext: modelContext)
+                coordinator.presentToast("Recalls synced (\(results.count))", symbol: "arrow.triangle.2.circlepath")
+            }
+        } catch {
+            await MainActor.run {
+                coordinator.presentAlert(title: "Sync Failed", message: "Could not fetch recalls. Check your network and try again.")
+            }
+        }
+    }
+}
+
+struct SCProfileView: View {
+    @Environment(\.modelContext) private var modelContext
+    @Query private var profiles: [SCUserProfile]
+
+    var profile: SCUserProfile {
+        if let p = profiles.first { return p }
+        let p = SCUserProfile()
+        modelContext.insert(p)
+        try? modelContext.save()
+        return p
+    }
+
+    var body: some View {
+        Form {
+            Section("Identity (Optional)") {
+                TextField("Name", text: Binding(get: { profile.displayName }, set: { profile.displayName = $0; save() }))
+                TextField("Email", text: Binding(get: { profile.email }, set: { profile.email = $0; save() }))
+                    .keyboardType(.emailAddress)
+                    .textInputAutocapitalization(.never)
+                TextField("Phone", text: Binding(get: { profile.phone }, set: { profile.phone = $0; save() }))
+                    .keyboardType(.phonePad)
+            }
+
+            Section("Location (Optional)") {
+                TextField("City", text: Binding(get: { profile.city }, set: { profile.city = $0; save() }))
+                TextField("ZIP", text: Binding(get: { profile.zip }, set: { profile.zip = $0; save() }))
+                    .keyboardType(.numberPad)
+            }
+
+            Section("Privacy") {
+                Toggle(isOn: Binding(get: { profile.preferAnonymous }, set: { profile.preferAnonymous = $0; save() })) {
+                    Label("Prefer Anonymous Reports", systemImage: "eye.slash.fill")
+                }
+                Text("If enabled, evidence packs will not include your name/contact info.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .navigationTitle("Your Template")
+        .navigationBarTitleDisplayMode(.inline)
+        .onAppear {
+            if profiles.isEmpty {
+                modelContext.insert(SCUserProfile())
+                try? modelContext.save()
+            }
+        }
+    }
+
+    private func save() { try? modelContext.save() }
+}
+
+// MARK: - (4) Recall Service (openFDA) + Upsert
+
+enum SCRecallService {
+    struct RecallDTO: Codable {
+        let id: String
+        let product: String
+        let reason: String
+        let dateIssued: Date
+        let lotCodes: [String]
+        let source: String
+    }
+
+    // openFDA endpoint for food enforcement
+    // NOTE: We keep this resilient and optional; app still works offline.
+    static func fetchRecentRecalls(limit: Int) async throws -> [RecallDTO] {
+        // Example query: last 60 days, limit N
+        // openFDA uses JSON; we parse defensively.
+        let urlStr = "https://api.fda.gov/food/enforcement.json?search=report_date:[NOW-60DAY%20TO%20NOW]&limit=\(min(max(limit, 1), 100))"
+        guard let url = URL(string: urlStr) else { return [] }
+
+        var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 20)
+        req.httpMethod = "GET"
+
+        let (data, _) = try await URLSession.shared.data(for: req)
+        let decoded = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        let results = decoded?["results"] as? [[String: Any]] ?? []
+
+        var out: [RecallDTO] = []
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withFullDate]
+
+        for item in results {
+            // openFDA keys can vary; extract safely
+            let recallNumber = (item["recall_number"] as? String) ?? (item["event_id"] as? String) ?? UUID().uuidString
+            let product = (item["product_description"] as? String) ?? "Unknown product"
+            let reason = (item["reason_for_recall"] as? String) ?? "Recall reason not provided"
+            let reportDateRaw = (item["report_date"] as? String) ?? ""
+
+            let dateIssued: Date = {
+                if let d = iso.date(from: reportDateRaw) { return d }
+                // fallback: try yyyyMMdd
+                if reportDateRaw.count == 8 {
+                    let y = Int(reportDateRaw.prefix(4)) ?? 2000
+                    let m = Int(reportDateRaw.dropFirst(4).prefix(2)) ?? 1
+                    let d = Int(reportDateRaw.suffix(2)) ?? 1
+                    var c = DateComponents()
+                    c.year = y; c.month = m; c.day = d
+                    return Calendar.current.date(from: c) ?? Date()
+                }
+                return Date()
+            }()
+
+            // lot codes (may be in "code_info" as free text)
+            let codeInfo = (item["code_info"] as? String) ?? ""
+            let lots = extractLotLikeTokens(from: codeInfo)
+
+            out.append(RecallDTO(id: recallNumber, product: product, reason: reason, dateIssued: dateIssued, lotCodes: lots, source: "openFDA"))
+        }
+
+        return out
+    }
+
+    static func upsertRecalls(_ dtos: [RecallDTO], modelContext: ModelContext) {
+        guard !dtos.isEmpty else { return }
+
+        for dto in dtos {
+            let fetch = FetchDescriptor<SCRecallAlert>(predicate: #Predicate { $0.id == dto.id })
+            if let existing = try? modelContext.fetch(fetch).first {
+                existing.product = dto.product
+                existing.reason = dto.reason
+                existing.dateIssued = dto.dateIssued
+                existing.source = dto.source
+                existing.lotCodes = dto.lotCodes
+            } else {
+                let alert = SCRecallAlert(id: dto.id, product: dto.product, reason: dto.reason, dateIssued: dto.dateIssued, source: dto.source, lotCodes: dto.lotCodes)
+                modelContext.insert(alert)
+            }
+        }
+        try? modelContext.save()
+    }
+
+    private static func extractLotLikeTokens(from text: String) -> [String] {
+        // crude but effective: split on whitespace/punct, keep alphanumerics length >= 4
+        let separators = CharacterSet.alphanumerics.inverted
+        let tokens = text.components(separatedBy: separators).filter { $0.count >= 4 }
+        // Keep unique, uppercase
+        var seen = Set<String>()
+        var out: [String] = []
+        for t in tokens {
+            let u = t.uppercased()
+            if !seen.contains(u) {
+                seen.insert(u)
+                out.append(u)
+            }
+        }
+        return out.prefix(20).map { $0 }
+    }
+}
+
+// MARK: - Notifications
+
+enum SCNotifications {
+    static func ensureCategories() {
+        let expiry = UNNotificationCategory(identifier: "expiry_reminder", actions: [], intentIdentifiers: [], options: [])
+        let recall = UNNotificationCategory(identifier: "recall_alert", actions: [], intentIdentifiers: [], options: [])
+        UNUserNotificationCenter.current().setNotificationCategories([expiry, recall])
+    }
+
+    static func requestAuthIfNeeded(coordinator: SCAppCoordinator) async {
+        let center = UNUserNotificationCenter.current()
+        let settings = await center.notificationSettings()
+        if settings.authorizationStatus == .authorized { return }
+        if settings.authorizationStatus == .denied {
+            await MainActor.run {
+                coordinator.presentAlert(title: "Notifications Disabled", message: "Enable notifications in Settings to get reminders and recall alerts.", settingsLink: true)
+            }
+            return
+        }
+        do {
+            let granted = try await center.requestAuthorization(options: [.alert, .badge, .sound])
+            if !granted {
+                await MainActor.run {
+                    coordinator.presentAlert(title: "Not Enabled", message: "Notifications weren't enabled. You can turn them on later in Settings.")
+                }
+            }
+        } catch {
+            await MainActor.run {
+                coordinator.presentAlert(title: "Notification Error", message: "Could not request notifications. Try again.")
+            }
+        }
+    }
+
+    static func scheduleExpiryReminder(scanId: UUID, fireDate: Date, title: String, body: String) {
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+        content.categoryIdentifier = "expiry_reminder"
+        content.userInfo = ["scanId": scanId.uuidString]
+
+        let trigger = UNCalendarNotificationTrigger(dateMatching: Calendar.current.dateComponents([.year, .month, .day], from: fireDate), repeats: false)
+        let req = UNNotificationRequest(identifier: "expiry:\(scanId.uuidString)", content: content, trigger: trigger)
+        UNUserNotificationCenter.current().add(req)
+    }
+}
+
+// MARK: - Onboarding View
+
+struct OnboardingView: View {
+    @AppStorage("hasCompletedOnboarding") private var hasCompletedOnboarding = false
+
+    var body: some View {
+        ZStack {
+            SCTheme.backgroundGradient(isDark: true).ignoresSafeArea()
+
+            VStack(spacing: 26) {
+                Spacer()
+
+                Image(systemName: "barcode.viewfinder")
+                    .font(.system(size: 80))
+                    .foregroundStyle(SCTheme.justiceRed)
+                    .shadow(color: SCTheme.justiceRed.opacity(0.5), radius: 20)
+
+                Text("SHELFCHECK")
+                    .font(.largeTitle.weight(.black))
+                    .foregroundStyle(.white)
+
+                Text("Food Justice for Detroit")
+                    .font(.headline)
+                    .foregroundStyle(.gray)
+
+                VStack(alignment: .leading, spacing: 22) {
+                    OnboardingFeatureRow(
+                        icon: "eye.fill",
+                        color: SCTheme.truthBlue,
+                        title: "Decode Hidden Dates",
+                        subtitle: "Reveal Julian codes and lot numbers"
+                    )
+
+                    OnboardingFeatureRow(
+                        icon: "exclamationmark.triangle.fill",
+                        color: SCTheme.warningYellow,
+                        title: "Spot Dumping",
+                        subtitle: "Identify 'Not For Resale' violations"
+                    )
+
+                    OnboardingFeatureRow(
+                        icon: "doc.text.fill",
+                        color: SCTheme.justiceRed,
+                        title: "Evidence Packs",
+                        subtitle: "Generate shareable reports with proof"
+                    )
+
+                    OnboardingFeatureRow(
+                        icon: "map.fill",
+                        color: SCTheme.freshGreen,
+                        title: "Community Signal",
+                        subtitle: "Flag repeat offenders to warn others"
+                    )
+                }
+                .padding(.horizontal, 30)
+                .padding(.vertical, 20)
+
+                Spacer()
+
+                Button {
+                    withAnimation { hasCompletedOnboarding = true }
+                } label: {
+                    Text("Join the Fight")
+                        .font(.headline.weight(.bold))
+                        .frame(maxWidth: .infinity)
+                        .padding()
+                        .background(SCTheme.justiceRed)
+                        .foregroundColor(.white)
+                        .cornerRadius(16)
+                        .shadow(color: SCTheme.justiceRed.opacity(0.5), radius: 10)
+                }
+                .padding(.horizontal, 30)
+                .padding(.bottom, 40)
+            }
+        }
+    }
+}
+
+struct OnboardingFeatureRow: View {
+    let icon: String
+    let color: Color
+    let title: String
+    let subtitle: String
+
+    var body: some View {
+        HStack(spacing: 16) {
+            Image(systemName: icon)
+                .font(.title2)
+                .foregroundStyle(color)
+                .frame(width: 30)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.white)
+                Text(subtitle)
+                    .font(.caption)
+                    .foregroundStyle(.gray)
+            }
+        }
+    }
+}
+
+// MARK: - DataScanner Wrapper
+
+struct SCDataScannerView: UIViewControllerRepresentable {
+    @Binding var recognizedTextLines: [String]
+    let onTapCapture: () -> Void
+
+    func makeUIViewController(context: Context) -> DataScannerViewController {
+        let vc = DataScannerViewController(
+            recognizedDataTypes: [.text(textContentType: .none)],
+            qualityLevel: .balanced,
+            recognizesMultipleItems: true,
+            isHighFrameRateTrackingEnabled: true,
+            isHighlightingEnabled: true
+        )
+        vc.delegate = context.coordinator
+        return vc
+    }
+
+    func updateUIViewController(_ uiViewController: DataScannerViewController, context: Context) {
+        if !uiViewController.isScanning {
+            try? uiViewController.startScanning()
+        }
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(recognizedTextLines: $recognizedTextLines, onTapCapture: onTapCapture)
+    }
+
+    final class Coordinator: NSObject, DataScannerViewControllerDelegate {
+        @Binding var recognizedTextLines: [String]
+        let onTapCapture: () -> Void
+
+        init(recognizedTextLines: Binding<[String]>, onTapCapture: @escaping () -> Void) {
+            _recognizedTextLines = recognizedTextLines
+            self.onTapCapture = onTapCapture
+        }
+
+        func dataScanner(_ dataScanner: DataScannerViewController, didTapOn item: RecognizedItem) {
+            onTapCapture()
+        }
+
+        func dataScanner(_ dataScanner: DataScannerViewController, didAdd addedItems: [RecognizedItem], allItems: [RecognizedItem]) {
+            updateLines(allItems)
+        }
+
+        func dataScanner(_ dataScanner: DataScannerViewController, didUpdate updatedItems: [RecognizedItem], allItems: [RecognizedItem]) {
+            updateLines(allItems)
+        }
+
+        private func updateLines(_ items: [RecognizedItem]) {
+            let lines = items.compactMap { item -> String? in
+                if case let .text(text) = item { return text.transcript }
+                return nil
+            }
+            DispatchQueue.main.async {
+                self.recognizedTextLines = lines
+            }
+        }
+    }
+}
+
+// MARK: - Safari + Share Sheet (6)
+
+struct SCSafariView: UIViewControllerRepresentable {
+    let url: URL
+    func makeUIViewController(context: Context) -> SFSafariViewController {
+        SFSafariViewController(url: url)
+    }
+    func updateUIViewController(_ uiViewController: SFSafariViewController, context: Context) {}
+}
+
+struct SCShareSheet: UIViewControllerRepresentable {
+    let items: [Any]
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: items, applicationActivities: nil)
+    }
+    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
+}
+
+// MARK: - PDF Preview
+
+struct SCPDFPreview: UIViewRepresentable {
+    let document: PDFDocument
+    func makeUIView(context: Context) -> PDFView {
+        let v = PDFView()
+        v.document = document
+        v.autoScales = true
+        v.displayMode = .singlePageContinuous
+        v.displayDirection = .vertical
+        return v
+    }
+    func updateUIView(_ uiView: PDFView, context: Context) {
+        uiView.document = document
+    }
+}
+
+// MARK: - Legal Screens (6)
+
+struct SCLegalView: View {
+    let kind: SCLegalKind
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                Text(textForKind(kind))
+                    .font(.callout)
+                    .foregroundStyle(.primary)
+                    .padding()
+            }
+            .navigationTitle(titleForKind(kind))
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Done") { dismiss() }
+                }
+            }
+            .background(SCTheme.backgroundGradient(isDark: true))
+        }
+    }
+
+    private func titleForKind(_ k: SCLegalKind) -> String {
+        switch k {
+        case .privacy: return "Privacy Policy"
+        case .terms: return "Terms of Service"
+        case .disclaimer: return "Disclaimer"
+        }
+    }
+
+    private func textForKind(_ k: SCLegalKind) -> String {
+        switch k {
+        case .privacy:
+            return """
+SHELFCHECK PRIVACY (In-App Summary)
+
+ShelfCheck stores scans, report drafts, and attachments locally on your device using SwiftData.
+If you choose to share an Evidence Pack, YOU control where it goes.
+
+What we store locally:
+- Scanned text, decoded date info, timestamps
+- Optional store details you enter
+- Optional attachments you add (photos)
+- Optional profile template you fill (name/contact) — can remain anonymous
+
+What we do NOT do in this build:
+- We do not create accounts.
+- We do not upload your data to a server automatically.
+- We do not sell your data.
+
+Network access:
+- Optional recall syncing from openFDA. This fetches recall records; it does not send your scans.
+
+"""
+        case .terms:
+            return """
+SHELFCHECK TERMS (In-App Summary)
+
+ShelfCheck is a consumer education and evidence organization tool.
+You are responsible for how you use outputs (PDFs, messages, reports).
+ShelfCheck provides “best-effort” decoding and classification and may be incorrect.
+
+No warranties.
+Use at your own risk.
+
+"""
+        case .disclaimer:
+            return """
+DISCLAIMER
+
+ShelfCheck is NOT a law firm and does NOT provide legal advice.
+ShelfCheck helps you organize evidence and understand basic consumer protections.
+
+If you need legal advice, contact a licensed attorney.
+
+"""
+        }
+    }
+}
+
+// MARK: - Permissions Help (6)
+
+struct SCPermissionsHelpView: View {
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section("Camera") {
+                    Text("ShelfCheck needs Camera access for live scanning.")
+                    Button("Open iOS Settings") { SCSystem.openAppSettings() }
+                }
+
+                Section("Location (Optional)") {
+                    Text("Location improves reporting and map accuracy.")
+                    Button("Open iOS Settings") { SCSystem.openAppSettings() }
+                }
+
+                Section("Notifications (Optional)") {
+                    Text("Notifications enable expiry reminders and recall alerts.")
+                    Button("Open iOS Settings") { SCSystem.openAppSettings() }
+                }
+            }
+            .navigationTitle("Permissions")
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Done") { dismiss() }
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Debug Sheet
+
+struct SCToastDebugView: View {
+    @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject private var coordinator: SCAppCoordinator
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Button("Show Success Toast") { coordinator.presentToast("All good", symbol: "checkmark.circle.fill") }
+                Button("Show Warning Toast") { coordinator.presentToast("Heads up", symbol: "exclamationmark.triangle.fill") }
+                Button("Show Error Alert") { coordinator.presentAlert(title: "Test Alert", message: "This is a test.") }
+            }
+            .navigationTitle("Debug")
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Done") { dismiss() }
+                }
+            }
+        }
+    }
+}
+
