@@ -1,0 +1,8 @@
+No account creation is required.
+No in-app purchases or subscriptions are present.
+User-created scans, report drafts, attachments, optional profile details, and app settings are stored locally on device using SwiftData.
+Camera permission is used only for live scanning of shelf labels, packaging text, and date codes.
+Location permission is optional and used only to tag scans and support nearby warned-store features.
+Photo library access is optional and used only when the user chooses evidence images or chooses to save evidence photos back to Photos.
+Notifications are optional and used only for reminders and alerts.
+The app may fetch public food recall data from openFDA. User scan contents are not uploaded as part of recall sync.
