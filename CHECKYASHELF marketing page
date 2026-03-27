@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CHECKYASHELF | App Marketing Page</title>
+  <meta
+    name="description"
+    content="CHECKYASHELF is a scanner app that helps users quickly scan and manage product or shelf information."
+  />
+  <style>
+    body {
+      margin: 0;
+      font-family: Arial, sans-serif;
+      background: #f7f7f7;
+      color: #222;
+      line-height: 1.6;
+    }
+
+    header {
+      background: #111827;
+      color: white;
+      padding: 60px 20px;
+      text-align: center;
+    }
+
+    header h1 {
+      margin: 0 0 10px;
+      font-size: 2.5rem;
+    }
+
+    header p {
+      max-width: 700px;
+      margin: 0 auto;
+      font-size: 1.1rem;
+    }
+
+    .container {
+      max-width: 1000px;
+      margin: 0 auto;
+      padding: 40px 20px;
+    }
+
+    .card {
+      background: white;
+      border-radius: 12px;
+      padding: 30px;
+      margin-bottom: 25px;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.08);
+    }
+
+    h2 {
+      color: #111827;
+      margin-top: 0;
+    }
+
+    ul {
+      padding-left: 20px;
+    }
+
+    .button {
+      display: inline-block;
+      background: #2563eb;
+      color: white;
+      text-decoration: none;
+      padding: 12px 20px;
+      border-radius: 8px;
+      font-weight: bold;
+      margin-top: 10px;
+    }
+
+    .button:hover {
+      background: #1d4ed8;
+    }
+
+    footer {
+      text-align: center;
+      padding: 25px 20px;
+      color: #666;
+      font-size: 0.95rem;
+    }
+
+    .small {
+      color: #555;
+      font-size: 0.95rem;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>CHECKYASHELF</h1>
+    <p>
+      CHECKYASHELF is a scanner app designed to help users quickly capture,
+      organize, and manage shelf or product information with ease.
+    </p>
+  </header>
+
+  <main class="container">
+    <section class="card">
+      <h2>About the App</h2>
+      <p>
+        CHECKYASHELF makes it easier to scan information and keep track of what
+        matters. Whether you are checking items, reviewing shelf details, or
+        organizing scanned data, the app is built to be fast, simple, and useful.
+      </p>
+    </section>
+
+    <section class="card">
+      <h2>Key Features</h2>
+      <ul>
+        <li>Fast and easy scanning experience</li>
+        <li>Simple interface for quick use</li>
+        <li>Organized information display</li>
+        <li>Designed for convenience and efficiency</li>
+      </ul>
+    </section>
+
+    <section class="card">
+      <h2>Who It’s For</h2>
+      <p>
+        CHECKYASHELF is for users who need a clean and efficient way to scan and
+        review item or shelf-related information from their mobile device.
+      </p>
+    </section>
+
+    <section class="card">
+      <h2>Support</h2>
+      <p>
+        Need help with CHECKYASHELF? Reach out using the contact information below.
+      </p>
+      <p class="small">
+        Email: <a href="mailto:prater10@icloud.com">prater10@icloud.com</a>
+      </p>
+    </section>
+
+    <section class="card">
+      <h2>Privacy Policy</h2>
+      <p>
+        Read our privacy policy here:
+      </p>
+      <a class="button" href="./privacy.html">View Privacy Policy</a>
+    </section>
+  </main>
+
+  <footer>
+    <p>&copy; 2026 CHECKYASHELF. All rights reserved.</p>
+  </footer>
+</body>
+</html>
